@@ -2,8 +2,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { getAppticsClient } from "./appticsConfig";
-import { off } from "process";
-
 
 const server = new McpServer({
   name: "zoho-apptics",
