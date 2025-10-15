@@ -1,0 +1,11 @@
+node_modules
+.DS_Store
+.env
+.env.local
+.env.*
+dist
+npm-debug.log*
+
+src/
+tsconfig.json
+package-lock.json
