@@ -1,6 +1,6 @@
 {
   "name": "@zoho_apptics/apptics-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for Zoho Apptics.",
   "license": "MIT",
   "types": "dist/index.d.ts",
@@ -19,6 +19,9 @@
     "typescript": "^5.9.3"
   },
   "main": "dist/index.js",
+  "bin": {
+    "apptics-mcp": "dist/index.js"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/zoho/apptics-mcp-server.git"
