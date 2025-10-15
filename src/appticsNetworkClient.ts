@@ -25,15 +25,14 @@ export class AppticsNetworkClient {
     clientSecret,
     refreshToken,
     appticsUri = "https://apptics.zoho.com/",
-    accountsUri = "https://accounts.zoho.com/",
-    accessToken = null
+    accountsUri = "https://accounts.zoho.com/"
   }: AppticsNetworkClientOptions) {
     this.clientId = clientId;
     this.clientSecret = clientSecret;
     this.refreshToken = refreshToken;
     this.appticsUri = appticsUri;
     this.accountsUri = accountsUri;
-    this.accessToken = accessToken;
+    this.accessToken = null;
   }
 
   private formatDate(date: Date): string {

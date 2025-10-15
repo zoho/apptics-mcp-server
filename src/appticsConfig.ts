@@ -13,7 +13,6 @@ const appticsEnvSchema = z.object({
   APPTICS_REFRESH_TOKEN: z.string().min(1),
   APPTICS_SERVER_URI: z.string().url().optional(),
   APPTICS_ACCOUNTS_URI: z.string().url().optional(),
-  APPTICS_ACCESS_TOKEN: z.string().optional()
 });
 
 let cachedClient: AppticsNetworkClient | undefined;
@@ -32,9 +31,6 @@ export function loadAppticsClientOptions(): AppticsNetworkClientOptions {
   }
   if (env.APPTICS_ACCOUNTS_URI) {
     options.accountsUri = env.APPTICS_ACCOUNTS_URI;
-  }
-  if (env.APPTICS_ACCESS_TOKEN) {
-    options.accessToken = env.APPTICS_ACCESS_TOKEN;
   }
 
   return options;
