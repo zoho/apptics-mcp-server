@@ -25,7 +25,7 @@ The dependency switcher tool:
   - If omitted, defaults to all discovered targets
 - `language` (optional): Project language - `"swift"` or `"objc"`. Auto-detected if not provided
 - `spmProductName` (optional): SPM product name (defaults to `"AppticsAnalytics"`)
-- `confirmCocoapodsSwitch` (optional): Required when switching to CocoaPods. Must be `true` to proceed
+- `confirmSpmSwitch` (optional but required to proceed when switching from CocoaPods to SPM). If omitted the tool will stop and ask you to confirm.
 - `verbose` (optional): Enable verbose output (default: `false`)
 - `skipBuild` (optional): Skip build validation after switching (default: `false`)
 
@@ -36,6 +36,7 @@ The dependency switcher tool:
   "projectPath": "/path/to/MyApp",
   "to": "spm",
   "targetNames": "all",
+  "confirmSpmSwitch": true,
   "verbose": true
 }
 ```
@@ -47,7 +48,6 @@ The dependency switcher tool:
   "projectPath": "/path/to/MyApp",
   "to": "cocoapods",
   "targetNames": ["MyApp", "MyAppExtension"],
-  "confirmCocoapodsSwitch": true,
   "language": "swift"
 }
 ```
@@ -57,22 +57,22 @@ The dependency switcher tool:
 ### SPM → CocoaPods Flow
 
 1. **Detection**: Checks if Apptics is currently using SPM
-2. **Confirmation**: Requires `confirmCocoapodsSwitch: true` (SPM is recommended)
-3. **Backup**: Creates timestamped backups of `Podfile` and `project.pbxproj`
-4. **Add Pod**: Adds Apptics pod (`Apptics-Swift` or `Apptics-SDK`) to Podfile for specified targets
-5. **Pod Install**: Runs `pod install` to install CocoaPods dependencies
-6. **Remove SPM**: Removes Apptics SPM package references from `project.pbxproj`
-7. **Validation**: Validates the build structure
+2. **Backup**: Creates timestamped backups of `Podfile` and `project.pbxproj`
+3. **Add Pod**: Adds Apptics pod (`Apptics-Swift` or `Apptics-SDK`) to Podfile for specified targets
+4. **Pod Install**: Runs `pod install` to install CocoaPods dependencies
+5. **Remove SPM**: Removes Apptics SPM package references from `project.pbxproj`
+6. **Validation**: Validates the build structure
 
 ### CocoaPods → SPM Flow
 
 1. **Detection**: Checks if Apptics is currently using CocoaPods
-2. **Backup**: Creates timestamped backups of `Podfile` and `project.pbxproj`
-3. **Remove Pod**: Removes Apptics pod lines from Podfile (preserves other pods)
-4. **Pod Install**: Runs `pod install` to update Pods project
-5. **Add SPM**: Adds Apptics SPM package reference and product dependencies to `project.pbxproj`
-6. **Resolve Packages**: Runs `xcodebuild -resolvePackageDependencies`
-7. **Validation**: Validates the build structure
+2. **Confirmation**: If `confirmSpmSwitch` is not provided, the tool stops and asks you to confirm (SPM is recommended). Re-run with `confirmSpmSwitch: true` to proceed.
+3. **Backup**: Creates timestamped backups of `Podfile` and `project.pbxproj`
+4. **Remove Pod**: Removes Apptics pod lines from Podfile (preserves other pods)
+5. **Pod Install**: Runs `pod install` to update Pods project
+6. **Add SPM**: Adds Apptics SPM package reference and product dependencies to `project.pbxproj`
+7. **Resolve Packages**: Runs `xcodebuild -resolvePackageDependencies`
+8. **Validation**: Validates the build structure
 
 ## Multi-Target Support
 

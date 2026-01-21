@@ -7,10 +7,11 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { findPbxprojFile, fileExists } from '../../sdk-integration/ios/utils';
+import { openProject, getNativeTargets } from './xcodeProject';
 import { detectAppticsDependency } from './detectors';
 import { addAppticsPodToPodfile, removeAppticsPodFromPodfile } from './podfileEditor';
 import { addAppticsSPMToProject, removeAppticsSPMFromProject } from './spmEditor';
-import { createBackups, validateBuildAfterSwitch, generateRollbackInstructions } from './buildValidator';
+import { createBackups, validateBuildAfterSwitch, generateRollbackInstructions, cleanupBackups } from './buildValidator';
 import type { SwitchParams, SwitchResult, IOSLanguage, TargetSelection } from './types';
 
 const execAsync = promisify(exec);
@@ -25,7 +26,7 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
     targetNames,
     language,
     spmProductName,
-    confirmCocoapodsSwitch,
+    confirmSpmSwitch,
     verbose = false,
     skipBuild = false
   } = params;
@@ -41,11 +42,10 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
     
     // Pre-flight checks
     if (fromState === 'both') {
-      throw new Error(
-        'Apptics is configured with both SPM and CocoaPods. ' +
-        'Please manually remove one before switching. ' +
-        'This prevents duplicate linkage issues.'
-      );
+      if (verbose) {
+        console.error('Warning: Both SPM and CocoaPods detected. Will clean up and switch to target dependency manager.');
+      }
+      // Don't fail - proceed with switch and clean up conflicting state
     }
     
     if (fromState === 'none') {
@@ -83,28 +83,12 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
     // Step 5: Perform switch
     if (to === 'cocoapods') {
       // SPM → CocoaPods
-      if (!confirmCocoapodsSwitch) {
-        throw new Error(
-          'Switching to CocoaPods requires explicit confirmation. ' +
-          'SPM is the recommended package manager. ' +
-          'Set confirmCocoapodsSwitch: true to proceed.'
-        );
-      }
-      
       if (verbose) console.error('Switching from SPM to CocoaPods...');
       
       // Add Apptics pod to Podfile
       const podfilePath = path.join(resolvedPath, 'Podfile');
-      const podfileExists = await fileExists(podfilePath);
-      
-      if (!podfileExists) {
-        // Create basic Podfile structure
-        await createBasicPodfile(podfilePath, resolvedTargetNames, resolvedLanguage);
-        filesChanged.push(podfilePath);
-      } else {
         await addAppticsPodToPodfile(podfilePath, resolvedTargetNames, resolvedLanguage);
         filesChanged.push(podfilePath);
-      }
       
       // Run pod install
       if (verbose) console.error('Running pod install...');
@@ -127,6 +111,17 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
       
     } else {
       // CocoaPods → SPM
+      if (fromState === 'cocoapods' && !confirmSpmSwitch) {
+        return {
+          success: false,
+          fromState,
+          toState: targetState,
+          filesChanged,
+          message: 'SPM is recommended. Do you want to switch Apptics to SPM? Reply with confirmSpmSwitch: true (yes) to proceed.',
+          needsConfirmation: true,
+          rollbackInstructions: 'No changes made. Re-run with confirmSpmSwitch: true to proceed.'
+        };
+      }
       if (verbose) console.error('Switching from CocoaPods to SPM...');
       
       // Remove Apptics pod from Podfile
@@ -135,8 +130,8 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
         await removeAppticsPodFromPodfile(podfilePath);
         filesChanged.push(podfilePath);
         
-        // Run pod install to update Pods project
-        if (verbose) console.error('Running pod install to update Pods project...');
+        // Run pod install to clean up Pods folder (remove Apptics pods)
+        if (verbose) console.error('Running pod install to clean up Pods folder...');
         try {
           const cmd = verbose ? 'pod install --verbose' : 'pod install';
           const env = {
@@ -145,15 +140,45 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
             LC_ALL: process.env.LC_ALL ?? 'en_US.UTF-8'
           };
           await execAsync(cmd, { cwd: resolvedPath, env, timeout: 300000 });
+          if (verbose) console.error('✓ Pods folder cleaned up');
         } catch (podError: any) {
-          // Continue even if pod install fails - might be okay if no other pods
-          if (verbose) console.error(`pod install warning: ${podError.message}`);
+          // If no other pods remain, Podfile will be empty and pod install may fail
+          // In that case, manually remove Pods folder and Podfile.lock
+          if (verbose) console.error(`Pod install failed (might be okay if no other pods): ${podError.message}`);
+          
+          // Check if Podfile has any remaining dependencies
+          try {
+            const content = await fs.readFile(podfilePath, 'utf-8');
+            const hasDeps = /pod\s+['"]/.test(content);
+            if (!hasDeps) {
+              // No dependencies left - safe to remove Pods folder
+              if (verbose) console.error('No pods remaining, cleaning up Pods folder...');
+              const podsDir = path.join(resolvedPath, 'Pods');
+              const podfileLock = path.join(resolvedPath, 'Podfile.lock');
+              const workspace = path.join(resolvedPath, path.basename(resolvedPath) + '.xcworkspace');
+              
+              if (await fileExists(podsDir)) {
+                await fs.rm(podsDir, { recursive: true, force: true });
+              }
+              if (await fileExists(podfileLock)) {
+                await fs.unlink(podfileLock);
+              }
+              // Keep workspace but remove Pods reference (Xcode will ignore it)
+            }
+          } catch {
+            // Ignore cleanup errors
+          }
         }
       }
       
+      // Remove CocoaPods artifacts first
+      const pbxprojPath = await findPbxprojFile(resolvedPath);
+      if (verbose) console.error('Removing CocoaPods artifacts...');
+      await removeCocoaPodsScriptPhases(pbxprojPath, resolvedTargetNames);
+      await removeCocoaPodsArtifacts(pbxprojPath, resolvedTargetNames);
+      
       // Add SPM package (will add to all specified targets, even if package already exists)
       if (verbose) console.error(`Adding SPM package to targets: ${resolvedTargetNames.join(', ')}`);
-      const pbxprojPath = await findPbxprojFile(resolvedPath);
       try {
         await addAppticsSPMToProject(pbxprojPath, resolvedTargetNames, resolvedLanguage, spmProductName);
         filesChanged.push(pbxprojPath);
@@ -178,16 +203,17 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
     if (verbose) console.error('Validating build...');
     const buildValidation = await validateBuildAfterSwitch(resolvedPath, to, skipBuild);
     
-    // Step 7: Return success result
+    // Step 7: Clean up backups on success
+    await cleanupBackups(backups);
+    
+    // Step 8: Return success result
     return {
       success: true,
       fromState,
       toState: targetState,
       filesChanged,
-      backupPaths: backups,
-      buildValidation,
       message: `Successfully switched Apptics from ${fromState} to ${to}.`,
-      rollbackInstructions: generateRollbackInstructions(backups)
+      buildValidation
     };
     
   } catch (error: any) {
@@ -217,18 +243,8 @@ async function resolveTargetNames(
   targetNames?: TargetSelection
 ): Promise<string[]> {
   const pbxprojPath = await findPbxprojFile(projectPath);
-  const content = await fs.readFile(pbxprojPath, 'utf-8');
-  const targetRegex = /\/\* ([^*]+?) \*\/ = \{\s*isa = PBXNativeTarget;/g;
-  const allTargets = new Set<string>();
-  let match: RegExpExecArray | null;
-  
-  while ((match = targetRegex.exec(content)) !== null) {
-    if (match[1]) {
-      allTargets.add(match[1].trim());
-    }
-  }
-  
-  const discoveredTargets = Array.from(allTargets);
+  const parsed = await openProject(pbxprojPath);
+  const discoveredTargets = getNativeTargets(parsed.project).map((t) => t.name);
   
   if (targetNames === 'all') {
     return discoveredTargets;
@@ -310,30 +326,86 @@ async function detectLanguage(projectPath: string): Promise<IOSLanguage> {
   return 'swift';
 }
 
-/**
- * Create basic Podfile structure
- */
-async function createBasicPodfile(
-  podfilePath: string,
-  targetNames: string[],
-  language: IOSLanguage
-): Promise<void> {
-  const sdkPod = language === 'swift' ? 'Apptics-Swift' : 'Apptics-SDK';
-  const targetBlocks = targetNames.map(target => 
-    `target '${target}' do
-  use_frameworks!
-
-  pod '${sdkPod}'
-end`
-  ).join('\n\n');
-  
-  const podfileContent = `source 'https://github.com/CocoaPods/Specs.git'
-
-platform :ios, '11.0'
-
-${targetBlocks}
-`;
-  
-  await fs.writeFile(podfilePath, podfileContent, 'utf-8');
+async function removeCocoaPodsScriptPhases(pbxprojPath: string, targetNames: string[]): Promise<void> {
+  try {
+    const parsed = await openProject(pbxprojPath);
+    const objects = parsed.objects;
+    const targets = getNativeTargets(parsed.project);
+    
+    const scriptSection = objects.PBXShellScriptBuildPhase ?? {};
+    const cocoaPodsPhaseIds: string[] = [];
+    
+    Object.entries(scriptSection).forEach(([key, value]) => {
+      if (key.endsWith('_comment')) return;
+      const phase: any = value;
+      const name = (phase.name ?? '').toString();
+      const nameLower = name.toLowerCase();
+      // Remove CocoaPods-generated phases like "[CP] Embed Pods Frameworks", "[CP] Check Pods Manifest.lock"
+      if (nameLower.startsWith('[cp]') || nameLower.includes('[cp]') || 
+          (nameLower.includes('pods') && (nameLower.includes('framework') || nameLower.includes('manifest')))) {
+        cocoaPodsPhaseIds.push(key);
+      }
+    });
+    
+    for (const targetName of targetNames) {
+      const target = targets.find((t) => t.name === targetName);
+      if (!target) continue;
+      
+      const buildPhases: Array<{ value: string; comment?: string }> =
+        (target.target.buildPhases as Array<{ value: string; comment?: string }>) ?? [];
+      target.target.buildPhases = buildPhases.filter((bp) => !cocoaPodsPhaseIds.includes(bp.value));
+    }
+    
+    // Remove the phase objects themselves
+    for (const phaseId of cocoaPodsPhaseIds) {
+      delete scriptSection[phaseId];
+      delete scriptSection[`${phaseId}_comment`];
+    }
+    
+    await parsed.save();
+  } catch (error: any) {
+    // Don't fail the switch if cleanup fails
+    console.error(`Warning: Failed to remove CocoaPods script phases: ${error.message}`);
+  }
 }
-
+async function removeCocoaPodsArtifacts(pbxprojPath: string, targetNames: string[]): Promise<void> {
+  try {
+    const parsed = await openProject(pbxprojPath);
+    const objects = parsed.objects;
+    const targets = getNativeTargets(parsed.project);
+    
+    // Remove xcconfig references from build configurations
+    const configSection = objects.XCBuildConfiguration ?? {};
+    Object.entries(configSection).forEach(([key, value]) => {
+      if (key.endsWith('_comment')) return;
+      const config: any = value;
+      if (config.baseConfigurationReference) {
+        delete config.baseConfigurationReference;
+      }
+    });
+    
+    // Remove Pods framework references from Frameworks build phase
+    for (const targetName of targetNames) {
+      const target = targets.find((t) => t.name === targetName);
+      if (!target) continue;
+      
+      const frameworks = objects.PBXFrameworksBuildPhase ?? {};
+      const frameworksPhases: Array<{ value: string; comment?: string }> =
+        (target.target.buildPhases as Array<{ value: string; comment?: string }>) ?? [];
+      
+      for (const phaseRef of frameworksPhases) {
+        const phase = frameworks[phaseRef.value];
+        if (!phase) continue;
+        const files: Array<{ value: string; comment?: string }> = phase.files ?? [];
+        phase.files = files.filter((f) => {
+          const comment = (f.comment ?? '').toString().toLowerCase();
+          return !comment.includes('pods_');
+        });
+      }
+    }
+    
+    await parsed.save();
+  } catch (error: any) {
+    console.error(`Warning: Failed to remove CocoaPods artifacts: ${error.message}`);
+  }
+}

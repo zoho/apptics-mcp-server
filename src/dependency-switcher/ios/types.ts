@@ -12,7 +12,7 @@ export interface SwitchParams {
   targetNames?: TargetSelection | undefined;
   language?: IOSLanguage | undefined;
   spmProductName?: string | undefined;
-  confirmCocoapodsSwitch?: boolean | undefined;
+  confirmSpmSwitch?: boolean | undefined;
   verbose?: boolean | undefined;
   skipBuild?: boolean | undefined;
 }
@@ -27,6 +27,7 @@ export interface SwitchResult {
   message: string;
   error?: string;
   rollbackInstructions?: string;
+  needsConfirmation?: boolean;
 }
 
 export interface BackupPaths {

@@ -159,3 +159,18 @@ export function generateRollbackInstructions(backups: BackupPaths): string {
   return instructions.join('\n');
 }
 
+
+/**
+ * Clean up backup files after successful switch
+ */
+export async function cleanupBackups(backups: BackupPaths): Promise<void> {
+  const filesToClean = [backups.podfile, backups.pbxproj].filter((p): p is string => Boolean(p));
+  
+  for (const backupPath of filesToClean) {
+    try {
+      await fs.unlink(backupPath);
+    } catch {
+      // Ignore if file doesn't exist or can't be deleted
+    }
+  }
+}

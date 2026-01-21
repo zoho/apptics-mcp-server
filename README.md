@@ -66,3 +66,26 @@ To configure Zoho Apptics MCP, you need to provide oauth credentials (client id,
 | `get_active_devices` | Reports active devices grouped by platform/device type/app version within the requested date range. |
 | `get_crash_detail` | Fetches detailed metadata, stack trace, and context for a specific crash using its `uniqueId`. |
 | `get_device_specific_crash_distribution` | Breaks down crash impact by device model for the given crash, with optional pagination and app-version filters. |
+
+## iOS SDK Integration Tools
+
+This MCP server also automates Apptics iOS SDK setup inside Xcode projects.
+
+- `integrate_apptics_ios_sdk` (default SPM): Adds the Apptics package, config file, disables user script sandboxing, injects imports + initialization, creates `AppticsManager.swift`, and links targets. Accepts `projectPath` and optional `targetNames` (`"all"` or specific target names).
+- `switch_apptics_dependency`: Swap Apptics dependency between SPM and CocoaPods if needed.
+
+Example MCP call (SPM, all targets):
+```json
+{
+  "projectPath": "/absolute/path/to/YourApp",
+  "packageManager": "spm",
+  "targetNames": "all",
+  "verbose": true,
+  "createAppticsManagerFile": true,
+  "useAppticsManagerWrapper": true
+}
+```
+
+Notes:
+- The pre-build script now declares an output marker (`$(DERIVED_FILE_DIR)/AppticsPreBuild.marker`) so Xcode skips reruns and avoids the “run during every build” warning, including multi-target projects.
+- If auto-detection ever fails, you can optionally supply `appDelegatePath` or `swiftUIAppPath`, but this is rarely needed.

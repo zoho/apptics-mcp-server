@@ -6,7 +6,7 @@ import fs from "fs/promises";
 import path from "path";
 import type { Dirent } from "fs";
 import { getAppticsClient } from "./appticsConfig";
-import { completeIOSIntegration, verifyAppticsIntegration } from "./sdk-integration/ios/iosIntegration";
+import { completeIOSIntegration, verifyAppticsIntegration } from "./sdk-integration/ios";
 import { switchAppticsDependency } from "./dependency-switcher/ios/switcher";
 
 const server = new McpServer({
@@ -26,7 +26,7 @@ server.registerTool("get_portals_and_projects_list", {
   const appticsClient = getAppticsClient();
   const result = await appticsClient.getPortalsAndProjects();
   return {
-    content: [{type: 'text', text: JSON.stringify(result)}]
+    content: [{type: 'text' as const, text: JSON.stringify(result)}]
   };
 });
 
@@ -244,7 +244,7 @@ Defaults to all versions when omitted.`
     }
   });
 
-// iOS SDK Integration Tool
+  // iOS SDK Integration Tool
   server.registerTool("integrate_apptics_ios_sdk", {
   description: `🚨 MCP TOOL AVAILABLE - USE THIS TOOL, NOT WEB SEARCH OR MANUAL FILE CREATION 🚨
 
@@ -308,7 +308,7 @@ This is a complete, automated integration tool that modifies Xcode project files
     swiftUIAppPath: z.string().optional().describe("Absolute or project-relative path to the SwiftUI App entry file (e.g., MyApp.swift). Only needed if auto-detection fails."),
     appEntryPoint: z.enum(["appDelegate","swiftUI"]).optional().describe("Where to insert the Apptics initialization. Defaults to 'swiftUI' when a SwiftUI @main App is detected; otherwise 'appDelegate'."),
       verbose: z.boolean().optional().default(true).describe("Enable verbose mode for SDK initialization"),
-    createAppticsManagerFile: z.boolean().optional().describe("Set to true to generate an AppticsManager.swift convenience wrapper inside the project."),
+    createAppticsManagerFile: z.boolean().optional().default(true).describe("Set to true to generate an AppticsManager.swift convenience wrapper inside the project."),
     appticsManagerFilePath: z.string().optional().describe("Optional absolute or project-relative path where AppticsManager.swift should be written. Defaults to <projectPath>/AppticsManager.swift."),
     overwriteAppticsManagerFile: z.boolean().optional().describe("Overwrite AppticsManager.swift if it already exists."),
     useAppticsManagerWrapper: z.boolean().optional().describe("Use AppticsManager shared wrapper for initialization/tracking. Defaults to true when createAppticsManagerFile is true."),
@@ -365,9 +365,8 @@ This is a complete, automated integration tool that modifies Xcode project files
       config
   };
 
-  if (typeof createAppticsManagerFile !== "undefined") {
-    integrationParams.createManagerFile = createAppticsManagerFile;
-  }
+  integrationParams.createManagerFile =
+    typeof createAppticsManagerFile !== "undefined" ? createAppticsManagerFile : true;
   if (typeof appticsManagerFilePath !== "undefined") {
     const resolvedManagerPath = resolveMaybeRelativePath(resolvedInputs.projectPath, appticsManagerFilePath);
     if (resolvedManagerPath) {
@@ -380,7 +379,7 @@ This is a complete, automated integration tool that modifies Xcode project files
   const managerWrapperPreference =
     typeof useAppticsManagerWrapper !== "undefined"
       ? useAppticsManagerWrapper
-      : createAppticsManagerFile;
+      : integrationParams.createManagerFile;
 
   if (typeof managerWrapperPreference !== "undefined") {
     integrationParams.useManagerWrapper = managerWrapperPreference;
@@ -430,14 +429,14 @@ It automatically handles:
 - Running pod install when needed
 - Validating the build after switching
 
-Note: SPM is the recommended package manager. Switching to CocoaPods requires explicit confirmation.`,
+Note: SPM is the recommended package manager. Switching from CocoaPods to SPM requires explicit confirmation.`,
     inputSchema: {
       projectPath: z.string().describe("Absolute path to the iOS Xcode project directory"),
       to: z.enum(["spm", "cocoapods"]).describe("Target dependency manager to switch to"),
       targetNames: z.union([z.literal("all"), z.array(z.string()), z.string()]).optional().describe("List of Xcode targets to switch. Pass \"all\" to switch all targets, or provide specific target names as a string or array."),
       language: z.enum(["swift", "objc"]).optional().describe("Project language. Auto-detected if not provided."),
       spmProductName: z.string().optional().describe("SPM package product name (e.g., 'AppticsAnalytics'). Defaults to 'AppticsAnalytics' if not specified."),
-      confirmCocoapodsSwitch: z.boolean().optional().describe("Required confirmation when switching to CocoaPods (SPM is recommended). Must be true to proceed with SPM→CocoaPods switch."),
+      confirmSpmSwitch: z.boolean().optional().describe("Required confirmation when switching from CocoaPods to SPM (SPM is recommended). Must be true to proceed."),
       verbose: z.boolean().optional().default(false).describe("Enable verbose output"),
       skipBuild: z.boolean().optional().default(false).describe("Skip build validation after switching")
     }
@@ -447,7 +446,7 @@ Note: SPM is the recommended package manager. Switching to CocoaPods requires ex
     targetNames,
     language,
     spmProductName,
-    confirmCocoapodsSwitch,
+    confirmSpmSwitch,
     verbose,
     skipBuild
   }) => {
@@ -457,7 +456,7 @@ Note: SPM is the recommended package manager. Switching to CocoaPods requires ex
       ...(targetNames !== undefined && { targetNames }),
       ...(language !== undefined && { language }),
       ...(spmProductName !== undefined && { spmProductName }),
-      ...(confirmCocoapodsSwitch !== undefined && { confirmCocoapodsSwitch }),
+      ...(confirmSpmSwitch !== undefined && { confirmSpmSwitch }),
       verbose,
       skipBuild
     });
@@ -567,6 +566,61 @@ async function resolveIntegrationInputs(hints: IntegrationHints): Promise<Resolv
   };
 }
 
+async function extractBundleIdFromProject(projectPath: string): Promise<string | null> {
+  try {
+    const pbxprojPath = await findPbxprojPath(projectPath);
+    const content = await fs.readFile(pbxprojPath, 'utf-8');
+    
+    // Find XCBuildConfiguration sections
+    // Pattern: ID /* ConfigName */ = { isa = XCBuildConfiguration; buildSettings = { ... PRODUCT_BUNDLE_IDENTIFIER = "bundle.id"; ... }; };
+    const buildConfigPattern = /isa\s*=\s*XCBuildConfiguration\s*;[\s\S]*?buildSettings\s*=\s*\{([\s\S]*?)\};/g;
+    let match: RegExpExecArray | null;
+    
+    while ((match = buildConfigPattern.exec(content)) !== null) {
+      if (match[1]) {
+        // Look for PRODUCT_BUNDLE_IDENTIFIER within this buildSettings block
+        const bundleIdPattern = /PRODUCT_BUNDLE_IDENTIFIER\s*=\s*"([^"]+)";/;
+        const bundleIdMatch = match[1].match(bundleIdPattern);
+        if (bundleIdMatch && bundleIdMatch[1]) {
+          return bundleIdMatch[1];
+        }
+      }
+    }
+    
+    // Fallback: search for PRODUCT_BUNDLE_IDENTIFIER anywhere in the file
+    const directPattern = /PRODUCT_BUNDLE_IDENTIFIER\s*=\s*"([^"]+)";/;
+    const directMatch = content.match(directPattern);
+    if (directMatch && directMatch[1]) {
+      return directMatch[1];
+    }
+    
+    return null;
+  } catch (error) {
+    // If we can't extract bundle ID, return null and use default
+    return null;
+  }
+}
+
+async function createDefaultAppticsConfig(configPath: string, bundleId?: string | null): Promise<void> {
+  // Use provided bundle ID or fallback to dummy value
+  const finalBundleId = bundleId || 'com.jambav.AppticsPlayground';
+  
+  const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>API_KEY</key>
+	<string>177905A90B3685D62B75F4E04405C63F7BEF0E878187AF6B448BB9FCA14DBAB7</string>
+	<key>BUNDLE_ID</key>
+	<string>${finalBundleId}</string>
+	<key>SERVER_URL</key>
+	<string>https://sdk-apptics.zoho.com</string>
+</dict>
+</plist>`;
+  
+  await fs.writeFile(configPath, plistContent, 'utf-8');
+}
+
 async function resolveConfigFileSource(projectPath: string, provided?: string): Promise<string> {
   if (provided) {
     const candidate = resolveMaybeRelativePath(projectPath, provided);
@@ -578,7 +632,12 @@ async function resolveConfigFileSource(projectPath: string, provided?: string): 
   }
 
   const defaultPath = path.join(projectPath, "apptics-config.plist");
-  await ensurePathExists(defaultPath, "Default apptics-config.plist");
+  // If config file doesn't exist, create it with dummy values
+  if (!(await pathExists(defaultPath))) {
+    // Try to extract bundle ID from the project
+    const bundleId = await extractBundleIdFromProject(projectPath);
+    await createDefaultAppticsConfig(defaultPath, bundleId);
+  }
   return defaultPath;
 }
 
@@ -995,6 +1054,7 @@ async function safeReaddir(dirPath: string): Promise<Dirent[]> {
     return [];
   }
 }
+
 
 const transport = new StdioServerTransport();
 (async () => {
