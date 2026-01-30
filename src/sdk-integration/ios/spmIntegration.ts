@@ -84,16 +84,11 @@ async function addSPMPackageSingle(params: {
     if (usesFsSync) {
       // For fs-sync projects, use Ruby xcodeproj for all operations to avoid corruption
       await addSPMPackageWithRuby(projectPath, targetName, packageProductName);
-      const scriptCmd = buildSPMScriptCommand({
-        projectPath,
-        uploadSymbolsConfigurations,
-        ...(configFilePath && { configFilePath }),
-        ...(appGroupIdentifier && { appGroupIdentifier }),
-        ...(uploadFrameworks && { uploadFrameworks })
-      });
-      await addBuildScriptPhaseWithRuby(pbxprojPath, targetName, 'Apptics pre build', scriptCmd);
-      } else {
+    } else {
       await addAppticsSPMToProject(pbxprojPath, [targetName], language, spmProductName);
+    }
+    
+    // Use Ruby xcodeproj for build script phases to ensure proper serialization (no regex needed)
     const scriptCmd = buildSPMScriptCommand({
       projectPath,
       uploadSymbolsConfigurations,
@@ -101,8 +96,7 @@ async function addSPMPackageSingle(params: {
       ...(appGroupIdentifier && { appGroupIdentifier }),
       ...(uploadFrameworks && { uploadFrameworks })
     });
-      await addBuildScriptPhaseWithParser(pbxprojPath, targetName, 'Apptics pre build', scriptCmd);
-    }
+    await addBuildScriptPhaseWithRuby(pbxprojPath, targetName, 'Apptics pre build', scriptCmd);
 
     let resolutionSucceeded = false;
     try {

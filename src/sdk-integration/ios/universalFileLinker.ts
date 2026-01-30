@@ -2,13 +2,16 @@
  * Universal File Linker for Xcode Projects
  * 
  * Creates source files and properly links them into Xcode project files (project.pbxproj).
- * This replaces the Python script to eliminate the Python dependency.
+ * Uses Ruby xcodeproj gem to ensure proper serialization without regex-based fixes.
  */
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { genId, findPbxprojFile, fileExists } from './utils';
-import { openProject, getNativeTargets } from '../../dependency-switcher/ios/xcodeProject';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { findPbxprojFile, fileExists } from './utils';
+
+const execFileAsync = promisify(execFile);
 
 interface LinkerParams {
   projectPath: string;
@@ -35,132 +38,6 @@ async function ensureFileOnDisk(
   return dest;
 }
 
-function findGroupByPath(objects: any, segments: string[]): string | undefined {
-  const groups = objects.PBXGroup ?? {};
-  return Object.entries(groups).find(([key, value]) => {
-    if (key.endsWith('_comment')) return false;
-    const entry: any = value;
-    const pathProp = entry.path ? String(entry.path) : '';
-    const nameProp = entry.name ? String(entry.name) : '';
-    return pathProp === segments.join('/') || nameProp === segments[segments.length - 1];
-  })?.[0];
-}
-
-function ensureGroup(objects: any, mainGroupId: string, folderRel: string): string {
-  if (!folderRel) return mainGroupId;
-  const segments = folderRel.split('/').filter(Boolean);
-  let currentId = mainGroupId;
-  const groups = objects.PBXGroup ?? {};
-
-  for (let i = 0; i < segments.length; i++) {
-    const subPath = segments.slice(0, i + 1);
-    const existing = findGroupByPath(objects, subPath);
-    if (existing) {
-      currentId = existing;
-      continue;
-  }
-    const newId = genId();
-    const name = segments[i];
-    groups[newId] = {
-      isa: 'PBXGroup',
-      children: [],
-      name,
-      path: subPath.join('/'),
-      sourceTree: '<group>'
-    };
-
-    // attach to parent
-    const parent = groups[currentId];
-    parent.children = parent.children || [];
-    const already = parent.children.some((c: any) => c.value === newId);
-    if (!already) {
-      parent.children.push({ value: newId, comment: name });
-      }
-    currentId = newId;
-    }
-
-  objects.PBXGroup = groups;
-  return currentId;
-}
-
-function ensureFileReference(
-  objects: any,
-  groupId: string,
-  fileName: string,
-  relPath: string
-): string {
-  const fileSection = objects.PBXFileReference ?? {};
-  const existing = Object.entries(fileSection).find(([key, value]) => {
-    if (key.endsWith('_comment')) return false;
-    const entry: any = value;
-    return entry.name === fileName || entry.path === relPath;
-  });
-  if (existing) {
-    return existing[0];
-  }
-
-  const fileRefId = genId();
-  fileSection[fileRefId] = {
-    isa: 'PBXFileReference',
-    lastKnownFileType: 'sourcecode.swift',
-    name: fileName,
-    path: relPath,
-    sourceTree: '<group>'
-  };
-  objects.PBXFileReference = fileSection;
-
-  const groups = objects.PBXGroup ?? {};
-  const group = groups[groupId];
-  group.children = group.children || [];
-  group.children.push({ value: fileRefId, comment: fileName });
-  groups[groupId] = group;
-  objects.PBXGroup = groups;
-
-  return fileRefId;
-}
-
-function findSourcesPhaseId(target: any): string | undefined {
-  const phases: Array<{ value: string; comment?: string }> = target.buildPhases ?? [];
-  return phases.find((p) => (p.comment ?? '').includes('Sources'))?.value;
-    }
-
-function ensureBuildFile(objects: any, fileRefId: string, fileName: string): string {
-  const buildSection = objects.PBXBuildFile ?? {};
-  const existing = Object.entries(buildSection).find(([key, value]) => {
-    if (key.endsWith('_comment')) return false;
-    const entry: any = value;
-    return entry.fileRef === fileRefId;
-  });
-  if (existing) return existing[0];
-
-  const buildId = genId();
-  buildSection[buildId] = {
-    isa: 'PBXBuildFile',
-    fileRef: fileRefId,
-    comment: `${fileName} in Sources`
-  };
-  objects.PBXBuildFile = buildSection;
-  return buildId;
-}
-
-function ensureFileInSourcesPhase(
-  objects: any,
-  sourcesPhaseId: string,
-  buildFileId: string,
-  fileName: string
-): void {
-  const sourcesSection = objects.PBXSourcesBuildPhase ?? {};
-  const phase = sourcesSection[sourcesPhaseId];
-  if (!phase) return;
-  phase.files = phase.files || [];
-  const already = phase.files.some((f: any) => f.value === buildFileId);
-  if (!already) {
-    phase.files.push({ value: buildFileId, comment: `${fileName} in Sources` });
-  }
-  sourcesSection[sourcesPhaseId] = phase;
-  objects.PBXSourcesBuildPhase = sourcesSection;
-}
-
 export async function linkFileToXcodeProject(params: LinkerParams): Promise<string> {
   const {
     projectPath,
@@ -173,7 +50,9 @@ export async function linkFileToXcodeProject(params: LinkerParams): Promise<stri
 
   const resolvedProjectPath = path.resolve(projectPath);
   const pbxprojPath = await findPbxprojFile(resolvedProjectPath);
+  const xcodeprojPath = path.dirname(pbxprojPath);
   
+  // Ensure file exists on disk first
   const dest = await ensureFileOnDisk(
     resolvedProjectPath,
     folderRelativeToProject,
@@ -182,27 +61,80 @@ export async function linkFileToXcodeProject(params: LinkerParams): Promise<stri
     overwrite
   );
 
-  const projectWrapper = await openProject(pbxprojPath);
-  const objects = projectWrapper.objects;
-  const nativeTargets = getNativeTargets(projectWrapper.project);
-  const targetNames = targets && targets.length > 0 ? targets : nativeTargets.map((t) => t.name);
-
-  const mainGroupId = projectWrapper.project.getFirstProject().firstProject.mainGroup;
-  const groupId = ensureGroup(objects, mainGroupId, folderRelativeToProject);
-  // Use file name relative to the containing group to avoid creating
-  // external file references (which show as arrows in Xcode).
-  const fileRefId = ensureFileReference(objects, groupId, fileName, fileName);
-  const buildFileId = ensureBuildFile(objects, fileRefId, fileName);
-
-  for (const tgtName of targetNames) {
-    const target = nativeTargets.find((t) => t.name === tgtName);
-    if (!target) continue;
-    const sourcesPhaseId = findSourcesPhaseId(target.target);
-    if (!sourcesPhaseId) continue;
-    ensureFileInSourcesPhase(objects, sourcesPhaseId, buildFileId, fileName);
-  }
-
-  await projectWrapper.save();
+  // Use Ruby xcodeproj to link the file - this ensures proper serialization without regex
+  const targetNames = targets && targets.length > 0 ? targets : [];
+  const script = `
+    require 'xcodeproj'
+    proj_path = ARGV.shift
+    folder_rel = ARGV.shift
+    file_name = ARGV.shift
+    targets = ARGV
+    
+    project = Xcodeproj::Project.open(proj_path)
+    main_group = project.main_group
+    
+    # Find or create the folder group
+    dir = folder_rel && folder_rel.length > 0 ? folder_rel : '.'
+    if dir == '.'
+      group = main_group
+    else
+      segments = dir.split('/').reject(&:empty?)
+      group = main_group
+      segments.each do |seg|
+        sub_group = group.groups.find { |g| g.display_name == seg || g.path == seg }
+        if sub_group
+          group = sub_group
+        else
+          group = group.new_group(seg, seg)
+          # source_tree is already set to "<group>" by new_group, no need to set again
+        end
+      end
+    end
+    
+    # Find or create file reference
+    file_ref = group.files.find { |f| f.path == file_name || f.display_name == file_name }
+    unless file_ref
+      file_ref = group.new_file(file_name)
+      # Ensure sourceTree is properly set and will be serialized correctly
+      file_ref.source_tree = '<group>' if file_ref.source_tree.nil? || file_ref.source_tree.to_s != '<group>'
+    end
+    
+    # Add to targets if specified
+    if targets.length > 0
+      targets.each do |tname|
+        tgt = project.targets.find { |t| t.name == tname }
+        next unless tgt
+        unless tgt.source_build_phase.files_references.include?(file_ref)
+          tgt.add_file_references([file_ref])
+        end
+      end
+    else
+      # Add to all native targets if no targets specified
+      project.targets.each do |tgt|
+        next unless tgt.respond_to?(:source_build_phase)
+        unless tgt.source_build_phase.files_references.include?(file_ref)
+          tgt.add_file_references([file_ref])
+        end
+      end
+    end
+    
+    project.save
+    
+    # Fix any unquoted sourceTree values that Ruby xcodeproj may have written
+    # This is a workaround for a Ruby xcodeproj serialization issue
+    pbxproj_path = File.join(proj_path, 'project.pbxproj')
+    content = File.read(pbxproj_path)
+    if content.include?('sourceTree = <group>')
+      content = content.gsub('sourceTree = <group>', 'sourceTree = "<group>"')
+      File.write(pbxproj_path, content)
+    end
+  `;
+  
+  await execFileAsync('ruby', ['-e', script, xcodeprojPath, folderRelativeToProject, fileName, ...targetNames], {
+    cwd: resolvedProjectPath,
+    maxBuffer: 5 * 1024 * 1024
+  });
+  
   return dest;
 }
 

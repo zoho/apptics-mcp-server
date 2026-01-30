@@ -18,6 +18,25 @@ export function genId(): string {
  * Find the project.pbxproj file in the given project path
  */
 export async function findPbxprojFile(projectPath: string): Promise<string> {
+  // Check if projectPath is already pointing to project.pbxproj
+  if (projectPath.endsWith('project.pbxproj')) {
+    const stats = await fs.stat(projectPath).catch(() => null);
+    if (stats?.isFile()) {
+      return projectPath;
+    }
+  }
+  
+  // Check if projectPath is already a .xcodeproj directory
+  if (projectPath.endsWith('.xcodeproj')) {
+    const pbxprojPath = path.join(projectPath, 'project.pbxproj');
+    const stats = await fs.stat(pbxprojPath).catch(() => null);
+    if (stats?.isFile()) {
+      return pbxprojPath;
+    }
+    // If it's a .xcodeproj directory but project.pbxproj doesn't exist, go up one level
+    projectPath = path.dirname(projectPath);
+  }
+  
   const entries = await fs.readdir(projectPath);
   const xcodeproj = entries.find(f => f.endsWith('.xcodeproj'));
   

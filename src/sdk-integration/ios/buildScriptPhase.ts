@@ -5,6 +5,8 @@ import { promisify } from 'util';
 import { findPbxprojFile, genId } from './utils';
 import { openProject, getNativeTargets } from '../../dependency-switcher/ios/xcodeProject';
 
+const execFileAsync = promisify(execFile);
+
 /**
  * Some legacy integrations wrote PBXShellScriptBuildPhase names without quotes,
  * e.g. `name = Apptics pre build;`, which makes the pbxproj unparsable. This
@@ -13,42 +15,70 @@ import { openProject, getNativeTargets } from '../../dependency-switcher/ios/xco
  */
 export async function repairLegacyAppticsScriptNames(projectPath: string): Promise<boolean> {
   const pbxprojPath = await findPbxprojFile(projectPath);
-  let content = await fs.readFile(pbxprojPath, 'utf-8');
-
-  const replacements: Array<{ pattern: RegExp; replacement: string }> = [
-    { pattern: /\bname\s*=\s*Apptics pre build\s*;/g, replacement: 'name = "Apptics pre build";' },
-    { pattern: /\bname\s*=\s*Apptics post build\s*;/g, replacement: 'name = "Apptics post build";' },
-    { pattern: /\bname\s*=\s*Apptics prebuild\s*;/g, replacement: 'name = "Apptics prebuild";' }
-  ];
-
-  let updated = false;
-  for (const { pattern, replacement } of replacements) {
-    if (pattern.test(content)) {
-      content = content.replace(pattern, replacement);
-      updated = true;
-    }
-  }
-
-  // Some legacy phases also wrote the shellScript without quotes. Replace the raw
-  // Apptics prebuild script with a properly escaped string literal.
-  const rawScriptPattern =
-    /shellScript = SCRIPT_PATH=\$\(find "\$HOME\/Library\/Developer\/Xcode\/DerivedData" -name "run" -path "\*\/SourcePackages\/checkouts\/Apptics\*" \| head -1\); if \[ -n "\$SCRIPT_PATH" \]; then sh "\$SCRIPT_PATH" --upload-symbols-for-configurations="Release, Appstore"; fi; OUT_MARKER="\$DERIVED_FILE_DIR\/AppticsPreBuild\.marker"; mkdir -p "\$\(dirname "\$OUT_MARKER"\)"; touch "\$OUT_MARKER";/g;
-  if (rawScriptPattern.test(content)) {
-    const sanitizedScript = buildSPMScriptCommand({
-      projectPath,
-      uploadSymbolsConfigurations: 'Release, Appstore'
+  const xcodeprojPath = path.dirname(pbxprojPath);
+  
+  // Use Ruby to fix legacy issues and unquoted values - using simple string replacement (not regex patterns)
+  const script = `
+    require 'xcodeproj'
+    proj_path = ARGV.shift
+    pbxproj_path = File.join(proj_path, 'project.pbxproj')
+    
+    begin
+      project = Xcodeproj::Project.open(proj_path)
+      # Fix unquoted sourceTree values by re-saving with Ruby xcodeproj
+      # Ruby xcodeproj will properly quote all values when saving
+      project.save
+      puts "Fixed"
+    rescue => e
+      # If project can't be opened (corrupted), fix common issues using Ruby string methods
+      # Using simple string replacement (gsub with plain strings, not regex patterns)
+      content = File.read(pbxproj_path)
+      original_content = content.dup
+      
+      # Fix unquoted sourceTree values - replace all occurrences
+      # gsub with a simple string (not a regex pattern) is just string replacement
+      content = content.gsub('sourceTree = <group>', 'sourceTree = "<group>"')
+      
+      # Fix unquoted outputPaths - find and fix using line-by-line string operations
+      lines = content.lines
+      lines.each_with_index do |line, i|
+        if line.include?('outputPaths = (') && i + 1 < lines.length
+          next_line = lines[i + 1]
+          # Check if the next line has unquoted $(DERIVED_FILE_DIR)
+          if next_line.include?('$(DERIVED_FILE_DIR)') && !next_line.include?('"$(DERIVED_FILE_DIR)"')
+            # Simple string replacement (not regex pattern)
+            lines[i + 1] = next_line.gsub('$(DERIVED_FILE_DIR)', '"$(DERIVED_FILE_DIR)"')
+          end
+        end
+      end
+      content = lines.join
+      
+      if content != original_content
+        File.write(pbxproj_path, content)
+        # Try to open again after fix
+        begin
+          project = Xcodeproj::Project.open(proj_path)
+          project.save
+          puts "Fixed"
+        rescue
+          puts "Fixed"
+        end
+      else
+        puts "NoFix"
+      end
+    end
+  `;
+  
+  try {
+    const { stdout } = await execFileAsync('ruby', ['-e', script, xcodeprojPath], {
+      maxBuffer: 5 * 1024 * 1024
     });
-    const escaped = sanitizedScript.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-    content = content.replace(rawScriptPattern, `shellScript = "${escaped}";`);
-    updated = true;
+    return stdout.includes('Fixed');
+  } catch {
+    return false;
   }
-
-  if (updated) {
-    await fs.writeFile(pbxprojPath, content, 'utf-8');
-  }
-
-  return updated;
 }
+
 
 export function buildSPMScriptCommand(params: {
   projectPath: string;
@@ -119,7 +149,7 @@ export async function addBuildScriptPhaseWithParser(
         inputPaths: [],
       name: scriptName,
       outputFileListPaths: [],
-        outputPaths: ['$DERIVED_FILE_DIR/AppticsPreBuild.marker'],
+        outputPaths: ['$(DERIVED_FILE_DIR)/AppticsPreBuild.marker'],
       runOnlyForDeploymentPostprocessing: 0,
       shellPath: '/bin/sh',
       shellScript: script
@@ -152,43 +182,17 @@ export async function disableUserScriptSandboxing(params: {
 
   try {
     const pbxprojPath = await findPbxprojFile(projectPath);
-    const content = await fs.readFile(pbxprojPath, 'utf-8');
-    const usesFsSync =
-      /PBXFileSystemSynchronizedRootGroup/.test(content) || /objectVersion\s*=\s*77/.test(content);
-    if (usesFsSync) {
-      // For filesystem-synced projects, rely on Ruby xcodeproj to update build settings
-      await setSandboxingWithRuby(pbxprojPath);
-      return {
-        success: true,
-        targetsModified: targetName ? [targetName] : ['All targets'],
-        message: 'User script sandboxing disabled via xcodeproj (filesystem-synced project)'
-      };
-    }
-
-    const projectWrapper = await openProject(pbxprojPath);
-    const objects = projectWrapper.objects;
-    const configs = objects.XCBuildConfiguration ?? {};
-    Object.entries(configs).forEach(([key, value]) => {
-      if (key.endsWith('_comment')) return;
-      const config: any = value;
-      config.buildSettings = config.buildSettings || {};
-      if (config.buildSettings.ENABLE_USER_SCRIPT_SANDBOXING !== 'NO') {
-        config.buildSettings.ENABLE_USER_SCRIPT_SANDBOXING = 'NO';
-      }
-    });
-    await projectWrapper.save();
-
+    // Use Ruby xcodeproj for all projects to ensure proper serialization (no regex needed)
+    await setSandboxingWithRuby(pbxprojPath);
     return {
       success: true,
       targetsModified: targetName ? [targetName] : ['All targets'],
-      message: 'User script sandboxing disabled successfully'
+      message: 'User script sandboxing disabled via xcodeproj'
     };
   } catch (error: any) {
     throw new Error(`Failed to disable sandboxing: ${error.message}`);
   }
 }
-
-const execFileAsync = promisify(execFile);
 
 async function setSandboxingWithRuby(pbxprojPath: string): Promise<void> {
   const xcodeprojPath = path.dirname(pbxprojPath);

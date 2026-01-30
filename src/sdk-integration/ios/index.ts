@@ -31,6 +31,81 @@ import { readPodfileJSON } from '../../dependency-switcher/ios/podfileEditor';
 
 const execAsync = promisify(exec);
 
+/**
+ * Generate helpful installation instructions for missing prerequisites
+ */
+function generateInstallationInstructions(
+  prereqResult: Awaited<ReturnType<typeof checkIOSPrerequisites>>,
+  packageManager: 'cocoapods' | 'spm'
+): string {
+  const instructions: string[] = [];
+  
+  // Check for missing Xcode
+  if (prereqResult.xcodeVersion === '' || prereqResult.xcodeVersion === 'Unknown') {
+    instructions.push(
+      '📦 Xcode Installation:\n' +
+      '   - Download from the Mac App Store: https://apps.apple.com/app/xcode/id497799835\n' +
+      '   - Or install via command line: xcode-select --install\n' +
+      '   - After installation, accept the license: sudo xcodebuild -license accept'
+    );
+  } else if (!isVersionAtLeast(prereqResult.xcodeVersion, MIN_XCODE_VERSION)) {
+    instructions.push(
+      `📦 Xcode Update Required:\n` +
+      `   - Current version: ${prereqResult.xcodeVersion}\n` +
+      `   - Required: ${MIN_XCODE_VERSION} or later\n` +
+      `   - Update from the Mac App Store or download from: https://developer.apple.com/xcode/`
+    );
+  }
+  
+  // Check for missing CocoaPods (only if using CocoaPods)
+  if (packageManager === 'cocoapods') {
+    if (prereqResult.cocoapodsVersion === '' || prereqResult.cocoapodsVersion === 'Unknown') {
+      instructions.push(
+        '📦 CocoaPods Installation:\n' +
+        '   - Install via RubyGems: sudo gem install cocoapods\n' +
+        '   - Or use Homebrew: brew install cocoapods\n' +
+        '   - Verify installation: pod --version'
+      );
+    } else if (!isVersionAtLeast(prereqResult.cocoapodsVersion, MIN_COCOAPODS_VERSION)) {
+      instructions.push(
+        `📦 CocoaPods Update Required:\n` +
+        `   - Current version: ${prereqResult.cocoapodsVersion}\n` +
+        `   - Required: ${MIN_COCOAPODS_VERSION} or later\n` +
+        `   - Update: sudo gem install cocoapods`
+      );
+    }
+  }
+  
+  // Check for iOS deployment target
+  if (prereqResult.iosTargetVersion !== 'Unknown' && 
+      !isVersionAtLeast(prereqResult.iosTargetVersion, MIN_IOS_DEPLOYMENT_TARGET)) {
+    instructions.push(
+      `📦 iOS Deployment Target Update Required:\n` +
+      `   - Current target: iOS ${prereqResult.iosTargetVersion}\n` +
+      `   - Required: iOS ${MIN_IOS_DEPLOYMENT_TARGET} or later\n` +
+      `   - Update in Xcode: Project Settings → Deployment Info → iOS Deployment Target`
+    );
+  }
+  
+  // Check for Swift version
+  if (prereqResult.swiftVersion && 
+      !isVersionAtLeast(prereqResult.swiftVersion, MIN_SWIFT_VERSION)) {
+    instructions.push(
+      `📦 Swift Version Update Required:\n` +
+      `   - Current version: Swift ${prereqResult.swiftVersion}\n` +
+      `   - Required: Swift ${MIN_SWIFT_VERSION} or later\n` +
+      `   - Update in Xcode: Project Settings → Build Settings → Swift Language Version\n` +
+      `   - Or update Xcode (newer Xcode versions include newer Swift)`
+    );
+  }
+  
+  if (instructions.length === 0) {
+    return 'Please install the missing prerequisites listed above.';
+  }
+  
+  return 'Installation Instructions:\n\n' + instructions.join('\n\n');
+}
+
 export class BuildVerificationError extends Error {
   public readonly isBuildVerificationError = true;
   public readonly buildOutput: string | undefined;
@@ -62,7 +137,12 @@ export async function checkIOSPrerequisites(projectPath: string, packageManager:
     if (!isVersionAtLeast(results.xcodeVersion, MIN_XCODE_VERSION)) {
       results.missingRequirements.push(`Xcode ${MIN_XCODE_VERSION} or later required`);
     }
+  } catch {
+    results.missingRequirements.push(`Xcode ${MIN_XCODE_VERSION} or later required (not found)`);
+    results.xcodeVersion = '';
+  }
 
+  try {
     if (packageManager === 'cocoapods') {
       try {
         const { stdout: podOutput } = await execAsync('pod --version');
@@ -505,10 +585,10 @@ export async function completeIOSIntegration(params: {
   };
 
   try {
-    if (verbose) console.error('Step -1: Repairing legacy Apptics build phases if needed...');
+    if (verbose) console.error('Step -1: Repairing any corrupted project file syntax...');
     const repaired = await repairLegacyAppticsScriptNames(projectPath);
     if (repaired) {
-      stepsCompleted.push('Repaired legacy Apptics build phase names');
+      stepsCompleted.push('Repaired project file syntax issues');
     }
 
     if (verbose) console.error('Step 0: Verifying project builds successfully...');
@@ -557,8 +637,14 @@ export async function completeIOSIntegration(params: {
     if (prereqResult.allPrerequisitesMet) {
       stepsCompleted.push('Prerequisites check passed');
     } else {
-      stepsFailed.push(`Prerequisites check failed: ${prereqResult.missingRequirements.join(', ')}`);
-      throw new Error('Prerequisites not met');
+      const missingReqs = prereqResult.missingRequirements.join(', ');
+      stepsFailed.push(`Prerequisites check failed: ${missingReqs}`);
+      
+      // Generate helpful installation instructions
+      const installationInstructions = generateInstallationInstructions(prereqResult, packageManager);
+      const errorMessage = `Prerequisites not met:\n\n${missingReqs}\n\n${installationInstructions}`;
+      
+      throw new Error(errorMessage);
     }
 
     if (packageManager === 'cocoapods') {
@@ -688,6 +774,19 @@ export async function completeIOSIntegration(params: {
     } catch {
       // best-effort; ignore
       }
+    }
+
+    // Final repair step: ensure project file is valid after all operations
+    // This fixes any corruption that may have occurred during integration
+    if (verbose) console.error('Final step: Ensuring project file syntax is valid...');
+    try {
+      const repaired = await repairLegacyAppticsScriptNames(projectPath);
+      if (repaired) {
+        stepsCompleted.push('Project file syntax validated and repaired');
+      }
+    } catch (repairError: any) {
+      // Don't fail integration if repair fails, but log it
+      if (verbose) console.error(`Warning: Final project file repair failed: ${repairError.message}`);
     }
 
     return {

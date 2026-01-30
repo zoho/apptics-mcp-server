@@ -283,9 +283,17 @@ async function linkAppticsManagerWithXcodeproj(
     if dir == '.'
       group = main_group
     else
-      group = main_group.groups.find { |g| g.display_name == dir || g.path == dir } || main_group.new_group(dir, dir)
+      group = main_group.groups.find { |g| g.display_name == dir || g.path == dir }
+      unless group
+        group = main_group.new_group(dir, dir)
+        # source_tree is already set to "<group>" by new_group, no need to set again
+      end
     end
-    file_ref = group.files.find { |f| f.path == file_name || f.display_name == file_name } || group.new_file(file_name)
+    file_ref = group.files.find { |f| f.path == file_name || f.display_name == file_name }
+    unless file_ref
+      file_ref = group.new_file(file_name)
+      # source_tree is already set to "<group>" by new_file, no need to set again
+    end
     targets.each do |tname|
       tgt = project.targets.find { |t| t.name == tname }
       next unless tgt
