@@ -1,49 +1,52 @@
 /**
- * SPM editor for adding/removing Apptics SPM package references without regex or raw text editing.
+ * SPM editor for adding/removing Apptics SPM package references.
  */
 
-import { genId } from '../../sdk-integration/ios/utils';
+import { genId, openProject, getNativeTargets } from '../../sdk-integration/ios/utils';
 import type { IOSLanguage } from './types';
-import { openProject, getNativeTargets } from './xcodeProject';
 
 const APPTICS_SPM_REPO_URL = 'https://github.com/zoho/Apptics-SP';
 const APPTICS_PACKAGE_NAME = 'Apptics';
 
 export async function removeAppticsSPMFromProject(
   pbxprojPath: string,
-  spmProductName?: string
+  _spmProductName?: string
 ): Promise<void> {
   const parsed = await openProject(pbxprojPath);
   const objects = parsed.objects;
-  const productName = spmProductName ?? 'AppticsAnalytics';
 
   const packageIds = findPackageReferenceIds(objects, APPTICS_SPM_REPO_URL);
-  if (packageIds.length === 0 && !hasProductDependency(objects, productName)) {
+  if (packageIds.length === 0) {
     return;
   }
-  
+
   deletePackageReferences(objects, packageIds);
   deleteProjectPackageRefs(objects, packageIds);
-  deleteProductDependencies(objects, productName, packageIds);
+  deleteProductDependenciesByPackage(objects, packageIds);
   removeAppticsScripts(objects);
 
   await parsed.save();
 }
 
+/**
+ * Map of target name -> SPM product names to add from Apptics-SP (e.g. AppticsAnalytics, AppticsRemoteConfig).
+ * Main targets get core + optional products; NSE targets get only AppticsNotificationServiceExtension when requested.
+ */
 export async function addAppticsSPMToProject(
   pbxprojPath: string,
-  targetNames: string[],
-  _language: IOSLanguage,
-  spmProductName?: string
+  targetProductMap: Record<string, string[]>,
+  _language: IOSLanguage
 ): Promise<void> {
   const parsed = await openProject(pbxprojPath);
   const objects = parsed.objects;
-  const packageProductName = spmProductName ?? 'AppticsAnalytics';
-  
+  const targetNames = Object.keys(targetProductMap).filter((name) => (targetProductMap[name]?.length ?? 0) > 0);
+
+  if (targetNames.length === 0) {
+    return;
+  }
+
   const packageRefId = ensurePackageReference(objects, APPTICS_SPM_REPO_URL);
   ensureProjectHasPackageRef(objects, packageRefId, APPTICS_PACKAGE_NAME);
-
-  const productDependencyId = ensureProductDependency(objects, packageRefId, packageProductName);
 
   const targets = getNativeTargets(parsed.project);
   const missingTargets = targetNames.filter(
@@ -55,8 +58,12 @@ export async function addAppticsSPMToProject(
 
   targetNames.forEach((targetName) => {
     const target = targets.find((t) => t.name === targetName);
-    if (!target) return;
-    ensureTargetHasProductDependency(target.target, productDependencyId, packageProductName);
+    const productNames = targetProductMap[targetName] ?? [];
+    if (!target || productNames.length === 0) return;
+    productNames.forEach((productName) => {
+      const productDependencyId = ensureProductDependency(objects, packageRefId, productName);
+      ensureTargetHasProductDependency(target.target, productDependencyId, productName);
+    });
   });
 
   await parsed.save();
@@ -94,16 +101,16 @@ function deleteProjectPackageRefs(objects: any, packageIds: string[]): void {
   });
 }
 
-function deleteProductDependencies(objects: any, productName: string, packageIds: string[]): void {
+/** Remove all SPM product dependencies that reference the given package refs (e.g. Apptics-SP). */
+function deleteProductDependenciesByPackage(objects: any, packageIds: string[]): void {
   const productSection = objects.XCSwiftPackageProductDependency ?? {};
 
   const toRemove: string[] = [];
   Object.entries(productSection).forEach(([key, value]) => {
     if (key.endsWith('_comment')) return;
     const entry: any = value;
-    const matchesProduct = normalize(entry.productName).toLowerCase() === productName.toLowerCase();
     const matchesPackage = entry.package && packageIds.includes(entry.package);
-    if (matchesProduct || matchesPackage) {
+    if (matchesPackage) {
       toRemove.push(key);
     }
   });
@@ -223,16 +230,30 @@ function ensureTargetHasProductDependency(target: any, productDependencyId: stri
   }
 }
 
-function hasProductDependency(objects: any, productName: string): boolean {
-  const section = objects.XCSwiftPackageProductDependency ?? {};
-  return Object.entries(section).some(([key, value]) => {
-    if (key.endsWith('_comment')) return false;
-    const entry: any = value;
-    return normalize(entry.productName).toLowerCase() === productName.toLowerCase();
-  });
-}
-
 function normalize(value: unknown): string {
   if (value === undefined || value === null) return '';
   return String(value).split('"').join('');
-  }
+}
+
+/**
+ * Returns Apptics SPM product names currently linked in the project (from Apptics-SP).
+ * Used when switching to CocoaPods to add the same modules via pods.
+ */
+export async function getAppticsSPMProductNamesFromProject(pbxprojPath: string): Promise<string[]> {
+  const parsed = await openProject(pbxprojPath);
+  const objects = parsed.objects;
+  const packageIds = findPackageReferenceIds(objects, APPTICS_SPM_REPO_URL);
+  if (packageIds.length === 0) return [];
+
+  const productNames = new Set<string>();
+  const section = objects.XCSwiftPackageProductDependency ?? {};
+  Object.entries(section).forEach(([key, value]) => {
+    if (key.endsWith('_comment')) return;
+    const entry: any = value;
+    if (entry.package && packageIds.includes(entry.package)) {
+      const name = normalize(entry.productName);
+      if (name) productNames.add(name);
+    }
+  });
+  return Array.from(productNames);
+}

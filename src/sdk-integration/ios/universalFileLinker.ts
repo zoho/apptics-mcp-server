@@ -2,7 +2,6 @@
  * Universal File Linker for Xcode Projects
  * 
  * Creates source files and properly links them into Xcode project files (project.pbxproj).
- * Uses Ruby xcodeproj gem to ensure proper serialization without regex-based fixes.
  */
 
 import * as fs from 'fs/promises';
@@ -61,7 +60,6 @@ export async function linkFileToXcodeProject(params: LinkerParams): Promise<stri
     overwrite
   );
 
-  // Use Ruby xcodeproj to link the file - this ensures proper serialization without regex
   const targetNames = targets && targets.length > 0 ? targets : [];
   const script = `
     require 'xcodeproj'

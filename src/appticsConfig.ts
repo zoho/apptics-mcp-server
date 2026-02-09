@@ -4,6 +4,7 @@ import {
   AppticsNetworkClient,
   AppticsNetworkClientOptions
 } from "./appticsNetworkClient";
+import { AppticsSdkConfigClient } from "./appticsSdkConfigClient";
 
 dotenv.config({ quiet: true });
 
@@ -16,6 +17,7 @@ const appticsEnvSchema = z.object({
 });
 
 let cachedClient: AppticsNetworkClient | undefined;
+let cachedSdkConfigClient: AppticsSdkConfigClient | undefined;
 
 export function loadAppticsClientOptions(): AppticsNetworkClientOptions {
   const env = appticsEnvSchema.parse(process.env);
@@ -43,4 +45,11 @@ export function getAppticsClient(): AppticsNetworkClient {
   }
 
   return cachedClient;
+}
+
+export function getAppticsSdkConfigClient(): AppticsSdkConfigClient {
+  if (!cachedSdkConfigClient) {
+    cachedSdkConfigClient = new AppticsSdkConfigClient(getAppticsClient());
+  }
+  return cachedSdkConfigClient;
 }

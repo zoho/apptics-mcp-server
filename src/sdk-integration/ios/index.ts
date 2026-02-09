@@ -1,8 +1,14 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
-import { addAppticsConfigFile, addAppticsManagerWrapper, setupMultiEnvironmentConfig } from './configFile';
+import {
+  addAppticsConfigFile,
+  addAppticsManagerWrapper,
+  APPTICS_MANAGER_SUGGESTION_SNIPPET,
+  setupMultiEnvironmentConfig
+} from './configFile';
 import { createOrUpdatePodfile, runPodInstall } from './cocoapodsIntegration';
 import {
   addBuildScriptPhaseWithParser,
@@ -25,9 +31,72 @@ import {
   resolveEntryFileForTarget
 } from './pbxprojUtils';
 import { addSPMPackage } from './spmIntegration';
-import { fileExists, findPbxprojFile } from './utils';
-import { openProject, getNativeTargets } from '../../dependency-switcher/ios/xcodeProject';
+import { fileExists, findPbxprojFile, openProject, getNativeTargets } from './utils';
 import { readPodfileJSON } from '../../dependency-switcher/ios/podfileEditor';
+import { generateFailureReport, formatFailureReport } from './errorReporter';
+import { getBuildSettings, getToolVersions } from './xcodeProjectParser';
+import {
+  getInstalledOptionalModuleIdsForCocoaPods,
+  getSPMCoreProductName,
+  getSPMProductNamesForTarget
+} from './appticsOptionalModules';
+import { parseSwiftFile } from './swiftParser';
+
+/** Directories to skip when scanning project for Apptics init (avoid Pods, build, etc.) */
+const SCAN_SKIP_DIRS = new Set([
+  'Pods', 'build', '.build', 'DerivedData', 'node_modules',
+  '.git', '.svn', 'Carthage', '.xcodeproj', '.xcworkspace'
+]);
+
+/**
+ * Scans the project for Swift (and optionally Obj-C) files that contain
+ * Apptics.initialize (direct init) or AppticsManager.shared.configure (manager init).
+ * Used to detect init in helper files called from AppDelegate/main.
+ */
+async function scanProjectForAppticsInit(
+  projectPath: string,
+  language: 'swift' | 'objc'
+): Promise<{ hasDirectInit: boolean; hasManagerInit: boolean }> {
+  const result = { hasDirectInit: false, hasManagerInit: false };
+  const maxFiles = 500;
+  let filesChecked = 0;
+
+  async function walk(dir: string): Promise<void> {
+    if (result.hasDirectInit && result.hasManagerInit) return;
+    if (filesChecked >= maxFiles) return;
+    let entries: { name: string; isDirectory: boolean }[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true }).then(dirs =>
+        dirs.map(d => ({ name: d.name, isDirectory: d.isDirectory() }))
+      );
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.isDirectory) {
+        if (SCAN_SKIP_DIRS.has(e.name)) continue;
+        await walk(path.join(dir, e.name));
+      } else if (e.name.endsWith('.swift') || (language === 'objc' && (e.name.endsWith('.m') || e.name.endsWith('.mm')))) {
+        if (filesChecked >= maxFiles) return;
+        filesChecked++;
+        try {
+          const content = await fs.readFile(path.join(dir, e.name), 'utf-8');
+          if (!result.hasDirectInit && (content.includes('Apptics.initialize') || content.includes('[Apptics initialize'))) {
+            result.hasDirectInit = true;
+          }
+          if (!result.hasManagerInit && (content.includes('AppticsManager.shared.configure') || content.includes('AppticsManager.shared.initialize'))) {
+            result.hasManagerInit = true;
+          }
+        } catch {
+          // skip unreadable files
+        }
+      }
+    }
+  }
+
+  await walk(projectPath);
+  return result;
+}
 
 const execAsync = promisify(exec);
 
@@ -131,35 +200,28 @@ export async function checkIOSPrerequisites(projectPath: string, packageManager:
   };
 
   try {
-    const { stdout: xcodeOutput } = await execAsync('xcodebuild -version');
-    const xcodeVersionMatch = xcodeOutput.match(/Xcode ([0-9.]+)/);
-    results.xcodeVersion = xcodeVersionMatch?.[1] ?? 'Unknown';
-    if (!isVersionAtLeast(results.xcodeVersion, MIN_XCODE_VERSION)) {
+    const toolVersions = await getToolVersions();
+    results.xcodeVersion = toolVersions.xcodeVersion || 'Unknown';
+    results.cocoapodsVersion = toolVersions.cocoapodsVersion || 'Unknown';
+    
+    if (results.xcodeVersion !== 'Unknown' && !isVersionAtLeast(results.xcodeVersion, MIN_XCODE_VERSION)) {
       results.missingRequirements.push(`Xcode ${MIN_XCODE_VERSION} or later required`);
+    } else if (results.xcodeVersion === 'Unknown' || !results.xcodeVersion) {
+      results.missingRequirements.push(`Xcode ${MIN_XCODE_VERSION} or later required (not found)`);
+      results.xcodeVersion = '';
     }
-  } catch {
-    results.missingRequirements.push(`Xcode ${MIN_XCODE_VERSION} or later required (not found)`);
-    results.xcodeVersion = '';
-  }
 
-  try {
     if (packageManager === 'cocoapods') {
-      try {
-        const { stdout: podOutput } = await execAsync('pod --version');
-        const podVersionMatch = podOutput.match(/([0-9.]+)/);
-        results.cocoapodsVersion = podVersionMatch?.[1] ?? 'Unknown';
-        if (!isVersionAtLeast(results.cocoapodsVersion, MIN_COCOAPODS_VERSION)) {
-          results.missingRequirements.push(`CocoaPods ${MIN_COCOAPODS_VERSION} or later required`);
-        }
-      } catch {
+      if (results.cocoapodsVersion !== 'Unknown' && !isVersionAtLeast(results.cocoapodsVersion, MIN_COCOAPODS_VERSION)) {
+        results.missingRequirements.push(`CocoaPods ${MIN_COCOAPODS_VERSION} or later required`);
+      } else if (results.cocoapodsVersion === 'Unknown' || !results.cocoapodsVersion) {
         results.missingRequirements.push(`CocoaPods ${MIN_COCOAPODS_VERSION} or later required (not found)`);
       }
     }
 
-    const pbxprojPath = await findPbxprojFile(projectPath);
-    const pbxContent = await fs.readFile(pbxprojPath, 'utf-8');
-    const targetMatch = pbxContent.match(/IPHONEOS_DEPLOYMENT_TARGET = (\d+\.\d+)/);
-    results.iosTargetVersion = targetMatch?.[1] ?? 'Unknown';
+    const buildSettings = await getBuildSettings(projectPath);
+    results.iosTargetVersion = buildSettings.iosDeploymentTarget ?? 'Unknown';
+    results.swiftVersion = buildSettings.swiftVersion ?? toolVersions.swiftVersion ?? '';
     
     if (
       results.iosTargetVersion !== 'Unknown' &&
@@ -168,12 +230,8 @@ export async function checkIOSPrerequisites(projectPath: string, packageManager:
       results.missingRequirements.push(`iOS ${MIN_IOS_DEPLOYMENT_TARGET} or later target required`);
     }
 
-    const swiftMatch = pbxContent.match(/SWIFT_VERSION = (\d+\.\d+)/);
-    if (swiftMatch?.[1]) {
-      results.swiftVersion = swiftMatch[1];
-      if (!isVersionAtLeast(results.swiftVersion, MIN_SWIFT_VERSION)) {
-        results.missingRequirements.push(`Swift ${MIN_SWIFT_VERSION} or later required`);
-      }
+    if (results.swiftVersion && !isVersionAtLeast(results.swiftVersion, MIN_SWIFT_VERSION)) {
+      results.missingRequirements.push(`Swift ${MIN_SWIFT_VERSION} or later required`);
     }
 
     results.allPrerequisitesMet = results.missingRequirements.length === 0;
@@ -183,6 +241,15 @@ export async function checkIOSPrerequisites(projectPath: string, packageManager:
   }
 }
 
+/**
+ * Build verification runs xcodebuild to ensure the project compiles before/after integration.
+ * To avoid creating a "build" folder inside the project:
+ * - Prefer -workspace when .xcworkspace exists (e.g. after CocoaPods), so -scheme + -derivedDataPath work.
+ * - Otherwise use -project and -scheme with -derivedDataPath.
+ * - When falling back to -target we pass SYMROOT/OBJROOT to a temp dir (some projects still write to project/build).
+ * - When using -workspace, CocoaPods' Pods.xcodeproj often sets SYMROOT to "${SRCROOT}/../build", so we always
+ *   pass SYMROOT and OBJROOT to a temp dir to prevent creating project/build.
+ */
 export async function verifyProjectBuilds(params: {
   projectPath: string;
   targetName: string;
@@ -196,8 +263,25 @@ export async function verifyProjectBuilds(params: {
     const pbxprojPath = await findPbxprojFile(projectPath);
     const xcodeprojPath = path.dirname(pbxprojPath);
     const xcodeprojName = path.basename(xcodeprojPath);
-    
-    let buildCommand = `xcodebuild -project "${xcodeprojName}" -scheme "${targetName}" -configuration Debug clean build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1`;
+    const projectBaseName = xcodeprojName.replace(/\.xcodeproj$/, '');
+    const workspacePath = path.join(projectPath, `${projectBaseName}.xcworkspace`);
+    const workspaceExists = await fileExists(path.join(workspacePath, 'contents.xcworkspacedata'));
+    const derivedDataPath = path.join(os.tmpdir(), `AppticsVerifyBuild-${Date.now()}`);
+    const derivedDataArg = `-derivedDataPath "${derivedDataPath}"`;
+    const buildDir = path.join(derivedDataPath, 'Build');
+    const symrootObjroot = `SYMROOT="${buildDir}" OBJROOT="${path.join(buildDir, 'Intermediates.noindex')}"`;
+    const destinationArg = `-destination "generic/platform=iOS"`;
+    const schemeBuildArgs = `-scheme "${targetName}" ${destinationArg} -configuration Debug ${derivedDataArg} ${symrootObjroot}`;
+    const targetBuildDir = path.join(os.tmpdir(), `AppticsVerifyBuild-${Date.now()}-target`);
+    const targetBuildArgs = `-target "${targetName}" ${destinationArg} -configuration Debug SYMROOT="${targetBuildDir}" OBJROOT="${targetBuildDir}"`;
+
+    const buildOpts = 'CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1';
+    let buildCommand: string;
+    if (workspaceExists) {
+      buildCommand = `xcodebuild -workspace "${projectBaseName}.xcworkspace" ${schemeBuildArgs} clean build ${buildOpts}`;
+    } else {
+      buildCommand = `xcodebuild -project "${xcodeprojName}" ${schemeBuildArgs} clean build ${buildOpts}`;
+    }
     let buildOutput = '';
     let buildSucceeded = false;
     
@@ -210,9 +294,12 @@ export async function verifyProjectBuilds(params: {
       buildOutput = stdout + stderr;
       buildSucceeded = buildOutput.includes('BUILD SUCCEEDED');
     } catch (error: any) {
-      if (error.message && error.message.includes('scheme')) {
-        if (verbose) console.error('Scheme not found, trying direct target build...');
-        buildCommand = `xcodebuild -project "${xcodeprojName}" -target "${targetName}" -configuration Debug clean build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1`;
+      const errMsg = error.message || '';
+      const output = (error.stdout || '') + (error.stderr || '');
+      if (errMsg.includes('scheme') || output.includes('scheme') || output.includes('derivedDataPath')) {
+        if (verbose) console.error('Scheme not found or derivedDataPath not allowed, trying direct target build...');
+        // xcodebuild does NOT allow -target with -workspace; must use -project + -target for fallback
+        buildCommand = `xcodebuild -project "${xcodeprojName}" ${targetBuildArgs} clean build ${buildOpts}`;
         
         try {
           const { stdout, stderr } = await execAsync(buildCommand, {
@@ -363,6 +450,8 @@ export async function verifyAppticsIntegration(params: {
         missingSteps.push('Run pod install');
       }
     } else {
+
+      // SPM verification
       const packageRepositoryURL = 'https://github.com/zoho/Apptics-SP';
       const packageRefs = objects.XCRemoteSwiftPackageReference ?? {};
       const hasPackageRef = Object.values(packageRefs).some((ref: any) => {
@@ -437,15 +526,27 @@ export async function verifyAppticsIntegration(params: {
     }
 
     const entryContent = await fs.readFile(entryFilePath, 'utf-8');
-    const importRegex = language === 'objc'
-      ? /#import\s+<Apptics\/Apptics\.h>/
-      : /import\s+Apptics/;
-    const initializationRegex = language === 'objc'
-      ? /\[Apptics initializeWithVerbose:/
-      : /Apptics\.initialize|AppticsManager\.shared\.(configure|initialize)/;
-
-    checks.appticsImportPresent = importRegex.test(entryContent);
-    checks.appticsInitialized = initializationRegex.test(entryContent);
+    
+    if (language === 'objc') {
+      checks.appticsImportPresent = entryContent.includes('#import <Apptics/Apptics.h>') || 
+                                     entryContent.includes('#import "Apptics.h"');
+      checks.appticsInitialized = entryContent.includes('[Apptics initializeWithVerbose:') ||
+                                   entryContent.includes('[Apptics initialize');
+    } else {
+      // Swift
+      const lines = entryContent.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('import ') && (trimmed.includes('Apptics') || trimmed.includes('AppticsAnalytics'))) {
+          checks.appticsImportPresent = true;
+        }
+        if (trimmed.includes('Apptics.initialize') || 
+            trimmed.includes('AppticsManager.shared.configure') ||
+            trimmed.includes('AppticsManager.shared.initialize')) {
+          checks.appticsInitialized = true;
+        }
+      }
+    }
     
     if (!checks.appticsImportPresent) {
       const target = entryPoint === 'swiftUI' ? 'SwiftUI App file' : 'AppDelegate';
@@ -537,6 +638,12 @@ export async function completeIOSIntegration(params: {
   entryPoint?: AppEntryPoint;
   packageManager?: 'cocoapods' | 'spm';
   spmProductName?: string;
+  /** Optional module ids (e.g. remoteConfig, feedbackKit). Configures dependencies and updates AppticsManager. */
+  optionalModuleIds?: string[];
+  /** When using notificationServiceExtension, target name(s) of the NSE so the NSE pod is added only to those targets. */
+  notificationServiceExtensionTargetNames?: string[];
+  /** Extra CocoaPods pod names to add to every main app target (e.g. missing or private pods). */
+  additionalCocoaPods?: string[];
   verbose?: boolean;
   config?: any;
   createManagerFile?: boolean;
@@ -554,6 +661,9 @@ export async function completeIOSIntegration(params: {
     entryPoint = 'appDelegate',
     packageManager = 'spm',
     spmProductName,
+    optionalModuleIds,
+    notificationServiceExtensionTargetNames,
+    additionalCocoaPods = [],
     verbose,
     config,
     createManagerFile,
@@ -565,13 +675,36 @@ export async function completeIOSIntegration(params: {
   if (targets.length === 0) {
     throw new Error('No target names provided for integration.');
   }
+  /** Only add imports, config, and AppticsManager content for modules whose pods are actually installed (CocoaPods: exclude skipped pods). */
+  const optionalIdsForCode =
+    packageManager === 'cocoapods' && optionalModuleIds?.length
+      ? getInstalledOptionalModuleIdsForCocoaPods(optionalModuleIds)
+      : optionalModuleIds ?? [];
+  /** SPM core product for main import/manager (AppticsAnalytics or AppticsAnalyticscoreWithKSCrash when crashKit requested). */
+  const coreProductName =
+    packageManager === 'spm'
+      ? (spmProductName ?? getSPMCoreProductName(optionalModuleIds ?? []))
+      : spmProductName;
   const shouldCreateManager = createManagerFile !== false; // default: always create unless explicitly disabled
   const managerWrapperFlag = useManagerWrapper ?? shouldCreateManager;
 
   const stepsCompleted: string[] = [];
   const stepsFailed: string[] = [];
   
-  const integrationReport = {
+  const integrationReport: {
+    targets: string[];
+    prerequisitesChecked: boolean;
+    packageManagerSetup: boolean;
+    configFileAdded: boolean;
+    sandboxingDisabled: boolean;
+    dependenciesInstalled: boolean;
+    importAdded: boolean;
+    initializationAdded: boolean;
+    managerFileAdded: boolean;
+    managerWrapperUsed: boolean;
+    managerSkippedReason?: string;
+    managerSuggestionSnippet?: string;
+  } = {
     targets,
     prerequisitesChecked: false,
     packageManagerSetup: false,
@@ -606,11 +739,11 @@ export async function completeIOSIntegration(params: {
         // through integration so we can add the package dependency.
         const output = buildVerification.buildOutput ?? buildVerification.message ?? '';
         const missingAppticsModule =
-          /Unable to find module dependency: 'Apptics'/.test(output) ||
-          /Unable to find module dependency: 'AppticsEventTracker'/.test(output);
+          output.includes("Unable to find module dependency: 'Apptics'") ||
+          output.includes("Unable to find module dependency: 'AppticsEventTracker'");
         const missingAppticsManager =
-          /cannot find 'AppticsManager' in scope/i.test(output) ||
-          /Use of unresolved identifier 'AppticsManager'/i.test(output);
+          output.toLowerCase().includes("cannot find 'appticsmanager' in scope") ||
+          output.includes("Use of unresolved identifier 'AppticsManager'");
 
         if (missingAppticsModule || missingAppticsManager) {
           stepsCompleted.push(
@@ -653,7 +786,10 @@ export async function completeIOSIntegration(params: {
         projectPath,
         targetNames: targets,
         language,
-        ...(config ?? {})
+        ...(config ?? {}),
+        ...(optionalModuleIds && optionalModuleIds.length > 0 ? { optionalModuleIds } : {}),
+        ...(notificationServiceExtensionTargetNames && notificationServiceExtensionTargetNames.length > 0 ? { notificationServiceExtensionTargetNames } : {}),
+        ...(additionalCocoaPods && additionalCocoaPods.length > 0 ? { additionalPodNames: additionalCocoaPods } : {})
       });
       integrationReport.packageManagerSetup = true;
       stepsCompleted.push('Podfile created');
@@ -663,7 +799,9 @@ export async function completeIOSIntegration(params: {
         projectPath,
         targetNames: targets,
         language,
-        spmProductName,
+        spmProductName: coreProductName,
+        optionalModuleIds,
+        notificationServiceExtensionTargetNames,
         ...(config ?? {})
       });
       integrationReport.packageManagerSetup = true;
@@ -673,7 +811,8 @@ export async function completeIOSIntegration(params: {
     if (verbose) console.error('Step 3: Adding config file...');
     await addAppticsConfigFile({
       projectPath,
-      configFileSource
+      configFileSource,
+      targetNames: targets
     });
     integrationReport.configFileAdded = true;
     stepsCompleted.push('Config file added');
@@ -696,18 +835,49 @@ export async function completeIOSIntegration(params: {
       stepsCompleted.push('SPM dependencies resolved');
     }
 
-    if (shouldCreateManager) {
+    // Detect existing Apptics init: first check entry file only; if not found there, run project-wide scan
+    // (e.g. init in a helper called from AppDelegate). If direct init without manager → skip manager and skip injecting init.
+    let skipManagerBecauseDirectInit = false;
+    const resolvedEntryPath = path.isAbsolute(entryFilePath) ? entryFilePath : path.resolve(projectPath, entryFilePath);
+    if (shouldCreateManager && language === 'swift') {
+      try {
+        const parsed = await parseSwiftFile(resolvedEntryPath);
+        const entryHasDirectInit = parsed.initialization.hasAppticsInitialization;
+        const entryHasManagerInit = parsed.initialization.hasAppticsManagerConfiguration;
+        if (entryHasDirectInit && !entryHasManagerInit) {
+          skipManagerBecauseDirectInit = true;
+          integrationReport.managerSkippedReason = 'existing_direct_init';
+          integrationReport.managerSuggestionSnippet = APPTICS_MANAGER_SUGGESTION_SNIPPET;
+        } else if (!entryHasDirectInit && !entryHasManagerInit) {
+          const scanned = await scanProjectForAppticsInit(projectPath, language);
+          if (scanned.hasDirectInit && !scanned.hasManagerInit) {
+            skipManagerBecauseDirectInit = true;
+            integrationReport.managerSkippedReason = 'existing_direct_init';
+            integrationReport.managerSuggestionSnippet = APPTICS_MANAGER_SUGGESTION_SNIPPET;
+          }
+        }
+      } catch {
+        // Proceed with creating manager as before.
+      }
+    }
+
+    if (shouldCreateManager && !skipManagerBecauseDirectInit) {
       if (verbose) console.error('Step 6: Adding Apptics manager wrapper...');
       const managerResult = await addAppticsManagerWrapper({
         projectPath,
         targetNames: targets,
         ...(managerFilePath ? { outputPath: managerFilePath } : {}),
         overwrite: overwriteManagerFile,
-        ...(spmProductName ? { spmProductName } : {})
+        ...(coreProductName ? { spmProductName: coreProductName } : {}),
+        ...(optionalIdsForCode.length > 0 ? { optionalModuleIds: optionalIdsForCode } : {})
       });
       integrationReport.managerFileAdded = managerResult.success;
       integrationReport.managerWrapperUsed = managerWrapperFlag;
       stepsCompleted.push('Apptics manager wrapper added');
+    } else if (skipManagerBecauseDirectInit) {
+      stepsCompleted.push(
+        'AppticsManager skipped (Apptics already initialized directly); see integrationReport.managerSuggestionSnippet to add wrapper manually if desired'
+      );
     }
 
     // Resolve per-target entry files so sub-targets also receive imports/initialization.
@@ -731,7 +901,8 @@ export async function completeIOSIntegration(params: {
         entryFilePath: entryPath,
         language,
         packageManager,
-        ...(spmProductName ? { spmProductName } : {})
+        ...(coreProductName ? { spmProductName: coreProductName } : {}),
+        ...(optionalIdsForCode.length > 0 ? { optionalModuleIds: optionalIdsForCode } : {})
       });
     }
     integrationReport.importAdded = true;
@@ -740,39 +911,52 @@ export async function completeIOSIntegration(params: {
     );
 
     if (verbose) console.error('Step 8: Adding initialization...');
-    for (const [entryPath] of entryFiles) {
-      const initParams: Parameters<typeof addAppticsInitialization>[0] = {
-        entryFilePath: entryPath,
-        language,
-        entryPoint,
-        includeAdvancedConfig: !!config,
-        useManagerWrapper: managerWrapperFlag
-      };
-      if (verbose !== undefined) {
-        initParams.verbose = verbose;
+    if (!skipManagerBecauseDirectInit) {
+      for (const [entryPath] of entryFiles) {
+        const initParams: Parameters<typeof addAppticsInitialization>[0] = {
+          entryFilePath: entryPath,
+          language,
+          entryPoint,
+          includeAdvancedConfig: !!config,
+          useManagerWrapper: managerWrapperFlag
+        };
+        if (verbose !== undefined) {
+          initParams.verbose = verbose;
+        }
+        if (config) {
+          initParams.config = config as AppticsInitConfig;
+        }
+        if (optionalIdsForCode.length > 0) {
+          initParams.optionalModuleIds = optionalIdsForCode;
+        }
+        await addAppticsInitialization(initParams);
       }
-      if (config) {
-        initParams.config = config as AppticsInitConfig;
-      }
-      await addAppticsInitialization(initParams);
+      integrationReport.initializationAdded = true;
+      stepsCompleted.push(
+        `Initialization added to entry file${entryFiles.size > 1 ? 's' : ''} (${[...entryFiles.values()].join(', ')})`
+      );
+    } else {
+      stepsCompleted.push(
+        'Initialization skipped (Apptics already initialized elsewhere in project; avoid double-init)'
+      );
     }
-    integrationReport.initializationAdded = true;
-    stepsCompleted.push(
-      `Initialization added to entry file${entryFiles.size > 1 ? 's' : ''} (${[...entryFiles.values()].join(', ')})`
-    );
 
-    // Final safety net: ensure every target has the Apptics product dependency.
+    // Final safety net: ensure every target has all required SPM product dependencies.
     if (packageManager === 'spm') {
       try {
         for (const tgt of targets) {
-          await ensureTargetHasProductDependency(
-            projectPath,
+          const productNames = getSPMProductNamesForTarget(
+            optionalModuleIds ?? [],
+            language,
             tgt,
-            spmProductName ?? 'AppticsAnalytics'
+            notificationServiceExtensionTargetNames ?? []
           );
-      }
-    } catch {
-      // best-effort; ignore
+          for (const productName of productNames) {
+            await ensureTargetHasProductDependency(projectPath, tgt, productName);
+          }
+        }
+      } catch {
+        // best-effort; ignore
       }
     }
 
@@ -797,13 +981,54 @@ export async function completeIOSIntegration(params: {
       message: 'Apptics integration completed successfully'
     };
   } catch (error: any) {
+    // Generate detailed failure report
+    let failureReportPath: string | undefined;
+    let failureReportFormatted: string | undefined;
+    
+    try {
+      const buildOutput = error instanceof BuildVerificationError ? error.buildOutput : undefined;
+      
+      const reportParams: Parameters<typeof generateFailureReport>[0] = {
+        projectPath,
+        targets,
+        packageManager: packageManager ?? 'spm',
+        language,
+        error,
+        stepsCompleted,
+        stepsFailed: [...stepsFailed, error.message],
+        integrationReport
+      };
+      
+      if (buildOutput) {
+        reportParams.buildOutput = buildOutput;
+      }
+      
+      const { reportPath, report } = await generateFailureReport(reportParams);
+      
+      failureReportPath = reportPath;
+      failureReportFormatted = formatFailureReport(report);
+      
+      // Output formatted report in verbose mode
+      if (verbose) {
+        console.error('\n' + failureReportFormatted);
+        console.error(`\n📄 Detailed failure report saved to: ${reportPath}\n`);
+      }
+    } catch (reportError: any) {
+      // If report generation fails, log but don't let it override the original error
+      if (verbose) {
+        console.error(`Warning: Failed to generate failure report: ${reportError.message}`);
+      }
+    }
+    
     return {
       success: false,
       stepsCompleted,
       stepsFailed: [...stepsFailed, error.message],
       integrationReport,
       message: `Integration failed: ${error.message}`,
-      error: error instanceof BuildVerificationError ? error : undefined
+      error: error instanceof BuildVerificationError ? error : undefined,
+      failureReportPath,
+      failureReportFormatted
     };
   }
 }
@@ -821,4 +1046,17 @@ export {
   runPodInstall,
   setupMultiEnvironmentConfig
 };
+
+// Export error reporting functionality
+export {
+  generateFailureReport,
+  formatFailureReport,
+  categorizeError,
+  generateSuggestions,
+  collectEnvironmentInfo,
+  IntegrationErrorCategory,
+  type IntegrationError,
+  type IntegrationFailureReport,
+  type EnvironmentInfo
+} from './errorReporter';
 

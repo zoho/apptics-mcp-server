@@ -1,10 +1,23 @@
+/**
+ * CocoaPods integration for Apptics iOS SDK.
+ * Apptics Core (Apptics-Swift / Apptics-SDK) is mandatory for optional modules.
+ * When adding optional modules (e.g. feedbackKit), we add core + optional pods explicitly.
+ * Optional pods may declare core as a dependency (to be tested); if so, we could later
+ * add only optional pods when user requested optional modules.
+ */
+
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { fileExists } from './utils';
-import { MIN_IOS_DEPLOYMENT_TARGET, normalizeTargets, isFileSystemSyncedProject } from './pbxprojUtils';
+import { MIN_IOS_DEPLOYMENT_TARGET, normalizeTargets } from './pbxprojUtils';
+
+/** AppticsNotificationServiceExtension pod requires platform :ios, '15.0' minimum. */
+const NSE_MIN_IOS = '15.0';
+import { isFileSystemSyncedProject } from './xcodeProjectParser';
 import { readPodfileJSON } from '../../dependency-switcher/ios/podfileEditor';
+import { getOptionalModules, SKIP_OPTIONAL_PODS_COCOAPODS } from './appticsOptionalModules';
 
 const execAsync = promisify(exec);
 
@@ -17,6 +30,12 @@ export async function createOrUpdatePodfile(params: {
   configFilePath?: string;
   appGroupIdentifier?: string;
   uploadFrameworks?: string;
+  /** Optional module ids (e.g. remoteConfig, feedbackKit). Adds corresponding pods per target. */
+  optionalModuleIds?: string[];
+  /** Target names that are Notification Service Extension targets; they get only AppticsNotificationServiceExtension, no core pod. */
+  notificationServiceExtensionTargetNames?: string[];
+  /** Extra CocoaPods pod names to add to every main app target (e.g. missing or private pods). */
+  additionalPodNames?: string[];
 }) {
   const {
     projectPath,
@@ -26,7 +45,10 @@ export async function createOrUpdatePodfile(params: {
     uploadSymbolsConfigurations = 'Release, Appstore',
     configFilePath,
     appGroupIdentifier,
-    uploadFrameworks
+    uploadFrameworks,
+    optionalModuleIds,
+    notificationServiceExtensionTargetNames: nseTargetNamesParam = [],
+    additionalPodNames = []
   } = params;
 
   const targets = await normalizeTargets(projectPath, targetName, targetNames);
@@ -35,9 +57,14 @@ export async function createOrUpdatePodfile(params: {
     throw new Error('No target names provided for Podfile generation.');
   }
 
+  const nseSet = new Set<string>(nseTargetNamesParam);
+  const mainTargetsSet = new Set<string>(targets.filter((t) => !nseSet.has(t)));
+  const nseTargetsSet = new Set<string>(targets.filter((t) => nseSet.has(t)));
+  const targetsSet = new Set<string>(targets);
+
   const podfilePath = path.join(projectPath, 'Podfile');
   const sdkPod = language === 'swift' ? 'Apptics-Swift' : 'Apptics-SDK';
-  
+
   const usesFsSync = await isFileSystemSyncedProject(projectPath);
   let scriptCmd: string;
   if (usesFsSync) {
@@ -45,23 +72,54 @@ export async function createOrUpdatePodfile(params: {
     scriptCmd = 'echo "Apptics pre build skipped for filesystem-synced project"';
   } else {
     scriptCmd = `sh "./Pods/Apptics-SDK/scripts/run" --upload-symbols-for-configurations="${uploadSymbolsConfigurations}"`;
-  if (configFilePath) {
-    scriptCmd += ` --config-file-path="${configFilePath}"`;
-  }
-  if (appGroupIdentifier) {
-    scriptCmd += ` --app-group-identifier="${appGroupIdentifier}"`;
-  }
-  if (uploadFrameworks) {
-    scriptCmd += ` --upload-symbols-for-frameworks="${uploadFrameworks}"`;
-  }
+    if (configFilePath) {
+      scriptCmd += ` --config-file-path="${configFilePath}"`;
+    }
+    if (appGroupIdentifier) {
+      scriptCmd += ` --app-group-identifier="${appGroupIdentifier}"`;
+    }
+    if (uploadFrameworks) {
+      scriptCmd += ` --upload-symbols-for-frameworks="${uploadFrameworks}"`;
+    }
   }
 
   const podfileJson = (await fileExists(podfilePath))
     ? await readPodfileJSON(podfilePath, projectPath).catch(() => createBasePodfileJSON())
     : createBasePodfileJSON();
 
-  const targetsSet = new Set<string>(targets);
-  ensureTargets(podfileJson, targetsSet, sdkPod, scriptCmd);
+  ensureTargets(podfileJson, mainTargetsSet, sdkPod, scriptCmd);
+  ensureTargetDefinitionsExist(podfileJson, nseTargetsSet, NSE_MIN_IOS);
+
+  const allMainPodNames: string[] = [...(additionalPodNames ?? [])];
+  if (optionalModuleIds && optionalModuleIds.length > 0) {
+    const skipSet = new Set(SKIP_OPTIONAL_PODS_COCOAPODS);
+    const mainModuleIds = optionalModuleIds.filter((id) => id !== 'notificationServiceExtension' && !skipSet.has(id));
+    const optionalPodNames = getOptionalModules(mainModuleIds)
+      .map((m) => (language === 'swift' ? m.cocoapods.swift : m.cocoapods.objc))
+      .filter((name): name is string => Boolean(name?.trim()));
+    allMainPodNames.push(...optionalPodNames);
+
+    const nsePodName = language === 'swift' ? 'AppticsNotificationServiceExtension' : 'AppticsNotificationServiceExtension';
+    const wantsNse = optionalModuleIds.includes('notificationServiceExtension') && !skipSet.has('notificationServiceExtension');
+    if (wantsNse) {
+      allMainPodNames.push(nsePodName);
+    }
+
+    (podfileJson.target_definitions ?? [])
+      .filter((d) => d.name !== 'Pods' && targetsSet.has(d.name))
+      .forEach((def) => {
+        if (mainTargetsSet.has(def.name)) {
+          allMainPodNames.forEach((podName) => ensureDependency(def, podName));
+        }
+        if (nseTargetsSet.has(def.name) && wantsNse) {
+          ensureDependency(def, nsePodName);
+        }
+      });
+  } else if (allMainPodNames.length > 0) {
+    (podfileJson.target_definitions ?? [])
+      .filter((d) => d.name !== 'Pods' && mainTargetsSet.has(d.name))
+      .forEach((def) => allMainPodNames.forEach((podName) => ensureDependency(def, podName)));
+  }
 
   await writePodfileJSON(podfilePath, projectPath, podfileJson);
 
@@ -79,7 +137,7 @@ export async function runPodInstall(params: {
   const { projectPath, verbose = false } = params;
 
   try {
-    const cmd = verbose ? 'pod install --verbose' : 'pod install';
+    const cmd = verbose ? 'pod install --repo-update --verbose' : 'pod install --repo-update';
     const env = {
       ...process.env,
       LANG: process.env.LANG ?? 'en_US.UTF-8',
@@ -157,8 +215,9 @@ function renderPodfile(podfile: PodfileJSON, iosVersion: string): string {
     for (const phase of def.script_phases ?? []) {
       const name = phase.name ?? '';
       const script = phase.script ?? '';
+      const escapedScript = String(script).split("'").join("\\'");
       lines.push(
-        `${inner}script_phase :name => '${name}', :script => '${String(script).replace(/'/g, "\\'")}', :execution_position => :before_compile`
+        `${inner}script_phase :name => '${name}', :script => '${escapedScript}', :execution_position => :before_compile`
       );
     }
     for (const child of def.children ?? []) {
@@ -188,7 +247,24 @@ function ensureTargets(
   podName: string,
   script: string
 ): void {
-  // Flatten existing children and drop any targets named 'Pods' to avoid duplicates.
+  flattenTargetDefinitions(podfile);
+  const defs = podfile.target_definitions!;
+  targets.forEach((targetName) => {
+    const def = ensureTargetDefinition(defs, targetName);
+    ensureDependency(def, podName);
+    ensureScriptPhase(def, script);
+  });
+}
+
+/** Ensures target definitions exist for NSE (or other) targets without adding core pod or script. Uses platformOverride (e.g. 15.0 for NSE) when provided. */
+function ensureTargetDefinitionsExist(podfile: PodfileJSON, targets: Set<string>, platformOverride?: string): void {
+  if (targets.size === 0) return;
+  flattenTargetDefinitions(podfile);
+  const defs = podfile.target_definitions!;
+  targets.forEach((targetName) => ensureTargetDefinition(defs, targetName, platformOverride));
+}
+
+function flattenTargetDefinitions(podfile: PodfileJSON): void {
   const flat: PodTargetDefinition[] = [];
   for (const def of podfile.target_definitions ?? []) {
     if (def.children && def.children.length > 0) {
@@ -198,23 +274,24 @@ function ensureTargets(
     }
   }
   podfile.target_definitions = flat.filter((d) => d.name !== 'Pods');
+}
 
-  const defs = podfile.target_definitions;
-  targets.forEach((targetName) => {
-    let def = defs.find((d) => d.name === targetName);
-    if (!def) {
-      def = {
-        name: targetName,
-        platform: { ios: MIN_IOS_DEPLOYMENT_TARGET },
-        uses_frameworks: true,
-        dependencies: [],
-        script_phases: []
-      };
-      defs.push(def);
-    }
-    ensureDependency(def, podName);
-    ensureScriptPhase(def, script);
-  });
+function ensureTargetDefinition(defs: PodTargetDefinition[], targetName: string, platformOverride?: string): PodTargetDefinition {
+  const iosVersion = platformOverride ?? MIN_IOS_DEPLOYMENT_TARGET;
+  let def = defs.find((d) => d.name === targetName);
+  if (!def) {
+    def = {
+      name: targetName,
+      platform: { ios: iosVersion },
+      uses_frameworks: true,
+      dependencies: [],
+      script_phases: []
+    };
+    defs.push(def);
+  } else if (platformOverride) {
+    def.platform = { ...def.platform, ios: platformOverride };
+  }
+  return def;
 }
 
 function ensureDependency(target: PodTargetDefinition, podName: string): void {
@@ -250,6 +327,11 @@ function dependencyName(dep: PodDependency): string | undefined {
   }
   if (dep && typeof dep === 'object' && 'name' in dep && (dep as any).name) {
     return String((dep as any).name);
+  }
+  // CocoaPods ipc podfile-json outputs deps as { "PodName": [version, ...opts] }
+  if (dep && typeof dep === 'object' && !Array.isArray(dep)) {
+    const keys = Object.keys(dep as Record<string, unknown>).filter((k) => !k.endsWith('_comment'));
+    if (keys.length === 1) return keys[0];
   }
   return undefined;
 }

@@ -6,11 +6,14 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { findPbxprojFile, fileExists } from '../../sdk-integration/ios/utils';
-import { openProject, getNativeTargets } from './xcodeProject';
+import {
+  getSPMProductNamesFromCocoaPodsPodNames,
+  getCocoaPodsPodNamesFromSPMProductNames
+} from '../../sdk-integration/ios/appticsOptionalModules';
+import { findPbxprojFile, fileExists, openProject, getNativeTargets } from '../../sdk-integration/ios/utils';
 import { detectAppticsDependency } from './detectors';
-import { addAppticsPodToPodfile, removeAppticsPodFromPodfile } from './podfileEditor';
-import { addAppticsSPMToProject, removeAppticsSPMFromProject } from './spmEditor';
+import { addAppticsPodToPodfile, removeAppticsPodFromPodfile, getAppticsPodNamesFromPodfile, getAppticsPodNamesByTargetFromPodfile } from './podfileEditor';
+import { addAppticsSPMToProject, removeAppticsSPMFromProject, getAppticsSPMProductNamesFromProject } from './spmEditor';
 import { createBackups, validateBuildAfterSwitch, generateRollbackInstructions, cleanupBackups } from './buildValidator';
 import type { SwitchParams, SwitchResult, IOSLanguage, TargetSelection } from './types';
 
@@ -85,10 +88,16 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
       // SPM → CocoaPods
       if (verbose) console.error('Switching from SPM to CocoaPods...');
       
-      // Add Apptics pod to Podfile
+      const pbxprojPathForRead = await findPbxprojFile(resolvedPath);
+      const spmProducts = await getAppticsSPMProductNamesFromProject(pbxprojPathForRead);
+      const podNamesToAdd = getCocoaPodsPodNamesFromSPMProductNames(spmProducts, resolvedLanguage);
+      if (verbose && spmProducts.length > 0) {
+        console.error(`Detected SPM products: ${spmProducts.join(', ')} → pods: ${podNamesToAdd.join(', ')}`);
+      }
+
       const podfilePath = path.join(resolvedPath, 'Podfile');
-        await addAppticsPodToPodfile(podfilePath, resolvedTargetNames, resolvedLanguage);
-        filesChanged.push(podfilePath);
+      await addAppticsPodToPodfile(podfilePath, resolvedTargetNames, resolvedLanguage, podNamesToAdd);
+      filesChanged.push(podfilePath);
       
       // Run pod install
       if (verbose) console.error('Running pod install...');
@@ -124,9 +133,42 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
       }
       if (verbose) console.error('Switching from CocoaPods to SPM...');
       
-      // Remove Apptics pod from Podfile
       const podfilePath = path.join(resolvedPath, 'Podfile');
+      let defaultSpmProducts: string[] = [spmProductName ?? 'AppticsAnalytics'];
+      let targetProductMap: Record<string, string[]> = {};
+      
       if (await fileExists(podfilePath)) {
+        // Get per-target pod names BEFORE modifying Podfile (for target-specific SPM products)
+        const podNamesByTarget = await getAppticsPodNamesByTargetFromPodfile(podfilePath);
+        const appticsPodNames = await getAppticsPodNamesFromPodfile(podfilePath);
+        defaultSpmProducts = getSPMProductNamesFromCocoaPodsPodNames(appticsPodNames, resolvedLanguage);
+        if (spmProductName && !defaultSpmProducts.includes(spmProductName)) {
+          defaultSpmProducts[0] = spmProductName;
+        }
+        if (verbose && appticsPodNames.length > 0) {
+          console.error(`Detected Apptics pods: ${appticsPodNames.join(', ')} → SPM products: ${defaultSpmProducts.join(', ')}`);
+        }
+        // Build target-specific product map (extension targets get AppticsExtension, main app gets full suite)
+        const projectUsesAppticsExtension = appticsPodNames.some((p) =>
+          p.toLowerCase() === 'appticsextension'
+        );
+        for (const t of resolvedTargetNames) {
+          const pods = podNamesByTarget[t];
+          let products = (pods && pods.length > 0)
+            ? getSPMProductNamesFromCocoaPodsPodNames(pods, resolvedLanguage)
+            : [...defaultSpmProducts];
+          // If any target uses AppticsExtension, add it to all Apptics targets (main app may share
+          // source that uses AppticsExtensionManager, e.g. AssistAPIManager with #if canImport)
+          if (
+            projectUsesAppticsExtension &&
+            !products.includes('AppticsExtension') &&
+            !products.every((p) => p === 'AppticsExtension')
+          ) {
+            products = [...products, 'AppticsExtension'];
+          }
+          targetProductMap[t] = products;
+        }
+        
         await removeAppticsPodFromPodfile(podfilePath);
         filesChanged.push(podfilePath);
         
@@ -149,13 +191,12 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
           // Check if Podfile has any remaining dependencies
           try {
             const content = await fs.readFile(podfilePath, 'utf-8');
-            const hasDeps = /pod\s+['"]/.test(content);
+            const hasDeps = content.includes("pod '") || content.includes('pod "');
             if (!hasDeps) {
               // No dependencies left - safe to remove Pods folder
               if (verbose) console.error('No pods remaining, cleaning up Pods folder...');
               const podsDir = path.join(resolvedPath, 'Pods');
               const podfileLock = path.join(resolvedPath, 'Podfile.lock');
-              const workspace = path.join(resolvedPath, path.basename(resolvedPath) + '.xcworkspace');
               
               if (await fileExists(podsDir)) {
                 await fs.rm(podsDir, { recursive: true, force: true });
@@ -163,7 +204,6 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
               if (await fileExists(podfileLock)) {
                 await fs.unlink(podfileLock);
               }
-              // Keep workspace but remove Pods reference (Xcode will ignore it)
             }
           } catch {
             // Ignore cleanup errors
@@ -171,16 +211,32 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
         }
       }
       
-      // Remove CocoaPods artifacts first
-      const pbxprojPath = await findPbxprojFile(resolvedPath);
-      if (verbose) console.error('Removing CocoaPods artifacts...');
-      await removeCocoaPodsScriptPhases(pbxprojPath, resolvedTargetNames);
-      await removeCocoaPodsArtifacts(pbxprojPath, resolvedTargetNames);
+      if (Object.keys(targetProductMap).length === 0) {
+        resolvedTargetNames.forEach((t) => { targetProductMap[t] = [...defaultSpmProducts]; });
+      }
       
-      // Add SPM package (will add to all specified targets, even if package already exists)
-      if (verbose) console.error(`Adding SPM package to targets: ${resolvedTargetNames.join(', ')}`);
+      const pbxprojPath = await findPbxprojFile(resolvedPath);
+      const podfileContent = await fs.readFile(podfilePath, 'utf-8').catch(() => '');
+      const hasOtherPods = /pod\s+['"]/.test(podfileContent);
+      
+      // Only remove CocoaPods artifacts when switching away from pods entirely (no other pods remain)
+      if (!hasOtherPods) {
+        if (verbose) console.error('Removing CocoaPods artifacts (no other pods remain)...');
+        await removeCocoaPodsScriptPhases(pbxprojPath, resolvedTargetNames);
+        await removeCocoaPodsArtifacts(pbxprojPath, resolvedTargetNames);
+      } else {
+        if (verbose) console.error('Keeping CocoaPods integration (other pods remain).');
+      }
+      
+      // Add SPM package with target-specific products
+      if (verbose) {
+        const productsStr = Object.entries(targetProductMap)
+          .map(([t, p]) => `${t}: [${p.join(', ')}]`)
+          .join('; ');
+        console.error(`Adding SPM package: ${productsStr}`);
+      }
       try {
-        await addAppticsSPMToProject(pbxprojPath, resolvedTargetNames, resolvedLanguage, spmProductName);
+        await addAppticsSPMToProject(pbxprojPath, targetProductMap, resolvedLanguage);
         filesChanged.push(pbxprojPath);
         if (verbose) console.error('SPM package added successfully');
       } catch (spmError: any) {

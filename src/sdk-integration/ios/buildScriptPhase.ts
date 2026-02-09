@@ -2,8 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { findPbxprojFile, genId } from './utils';
-import { openProject, getNativeTargets } from '../../dependency-switcher/ios/xcodeProject';
+import { findPbxprojFile, genId, openProject, getNativeTargets } from './utils';
 
 const execFileAsync = promisify(execFile);
 
@@ -17,7 +16,6 @@ export async function repairLegacyAppticsScriptNames(projectPath: string): Promi
   const pbxprojPath = await findPbxprojFile(projectPath);
   const xcodeprojPath = path.dirname(pbxprojPath);
   
-  // Use Ruby to fix legacy issues and unquoted values - using simple string replacement (not regex patterns)
   const script = `
     require 'xcodeproj'
     proj_path = ARGV.shift
@@ -25,28 +23,19 @@ export async function repairLegacyAppticsScriptNames(projectPath: string): Promi
     
     begin
       project = Xcodeproj::Project.open(proj_path)
-      # Fix unquoted sourceTree values by re-saving with Ruby xcodeproj
-      # Ruby xcodeproj will properly quote all values when saving
       project.save
       puts "Fixed"
     rescue => e
-      # If project can't be opened (corrupted), fix common issues using Ruby string methods
-      # Using simple string replacement (gsub with plain strings, not regex patterns)
       content = File.read(pbxproj_path)
       original_content = content.dup
       
-      # Fix unquoted sourceTree values - replace all occurrences
-      # gsub with a simple string (not a regex pattern) is just string replacement
       content = content.gsub('sourceTree = <group>', 'sourceTree = "<group>"')
       
-      # Fix unquoted outputPaths - find and fix using line-by-line string operations
       lines = content.lines
       lines.each_with_index do |line, i|
         if line.include?('outputPaths = (') && i + 1 < lines.length
           next_line = lines[i + 1]
-          # Check if the next line has unquoted $(DERIVED_FILE_DIR)
           if next_line.include?('$(DERIVED_FILE_DIR)') && !next_line.include?('"$(DERIVED_FILE_DIR)"')
-            # Simple string replacement (not regex pattern)
             lines[i + 1] = next_line.gsub('$(DERIVED_FILE_DIR)', '"$(DERIVED_FILE_DIR)"')
           end
         end
@@ -111,8 +100,6 @@ export function buildSPMScriptCommand(params: {
 
   return scriptCmd;
 }
-
-// Deprecated legacy entry point removed: all script phase mutations now use structured edits only.
 
 export async function addBuildScriptPhaseWithParser(
   pbxprojPath: string,
@@ -182,7 +169,6 @@ export async function disableUserScriptSandboxing(params: {
 
   try {
     const pbxprojPath = await findPbxprojFile(projectPath);
-    // Use Ruby xcodeproj for all projects to ensure proper serialization (no regex needed)
     await setSandboxingWithRuby(pbxprojPath);
     return {
       success: true,

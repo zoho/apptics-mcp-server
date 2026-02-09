@@ -1,7 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { fileExists, findPbxprojFile, genId } from './utils';
-import { openProject, getNativeTargets } from '../../dependency-switcher/ios/xcodeProject';
+import { fileExists, findPbxprojFile, genId, openProject, getNativeTargets } from './utils';
 
 export type AppEntryPoint = 'appDelegate' | 'swiftUI';
 
@@ -13,18 +12,9 @@ export type AppticsInitConfig = {
 
 export const MIN_XCODE_VERSION = '9.0';
 export const MIN_COCOAPODS_VERSION = '1.5.3';
-export const MIN_IOS_DEPLOYMENT_TARGET = '11.0';
+/** Default minimum iOS for Apptics CocoaPods integration (e.g. AppticsMessaging requires 13.0). */
+export const MIN_IOS_DEPLOYMENT_TARGET = '13.0';
 export const MIN_SWIFT_VERSION = '4.0';
-
-export async function isFileSystemSyncedProject(projectPath: string): Promise<boolean> {
-  try {
-    const pbxprojPath = await findPbxprojFile(projectPath);
-    const content = await fs.readFile(pbxprojPath, 'utf-8');
-    return /PBXFileSystemSynchronizedRootGroup/.test(content) || /objectVersion\s*=\s*77/.test(content);
-  } catch {
-    return false;
-  }
-}
 
 export async function listAllNativeTargets(projectPath: string): Promise<string[]> {
   const pbxprojPath = await findPbxprojFile(projectPath);
@@ -116,7 +106,21 @@ export async function findSwiftUIAppFileForTargetFolder(targetFolder: string): P
     if (!candidate.endsWith('.swift')) return false;
     try {
       const content = await fs.readFile(candidate, 'utf-8');
-      return /@main\s+struct\s+\w+\s*:\s*App/.test(content);
+      const lines = content.split('\n');
+      let hasMainAttribute = false;
+      let hasAppStruct = false;
+      
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('@main')) {
+          hasMainAttribute = true;
+        }
+        if (trimmed.includes('struct ') && trimmed.includes(': App')) {
+          hasAppStruct = true;
+        }
+      }
+      
+      return hasMainAttribute && hasAppStruct;
     } catch {
       return false;
     }

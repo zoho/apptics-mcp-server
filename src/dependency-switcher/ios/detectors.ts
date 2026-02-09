@@ -1,12 +1,11 @@
 /**
- * Detection module for Apptics dependency state without regex or raw text parsing.
+ * Detection module for Apptics dependency state.
  */
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { findPbxprojFile, fileExists } from '../../sdk-integration/ios/utils';
+import { findPbxprojFile, fileExists, openProject } from '../../sdk-integration/ios/utils';
 import { readPodfileJSON } from './podfileEditor';
-import { openProject } from './xcodeProject';
 import type { DependencyState, DetectionResult } from './types';
 
 const APPTICS_SPM_REPO_URL = 'https://github.com/zoho/Apptics-SP';
@@ -53,7 +52,7 @@ async function detectPods(podfilePath: string, cwd: string): Promise<{ hasCocoaP
   try {
     const podfileJson = await readPodfileJSON(podfilePath, cwd);
     const names = collectPodDependencies(podfileJson.target_definitions);
-    const match = names.find((name) => name.toLowerCase().startsWith('apptics-'));
+    const match = names.find((name) => name.toLowerCase().startsWith('apptics'));
     if (match) {
       return { hasCocoaPods: true, appticsPodName: match };
     }
@@ -85,6 +84,11 @@ function dependencyName(dep: unknown): string | undefined {
   }
   if (dep && typeof dep === 'object' && 'name' in dep && (dep as any).name) {
     return String((dep as any).name);
+  }
+  // CocoaPods ipc podfile-json outputs deps as { "PodName": [version, ...opts] }
+  if (dep && typeof dep === 'object' && !Array.isArray(dep)) {
+    const keys = Object.keys(dep as Record<string, unknown>).filter((k) => !k.endsWith('_comment'));
+    if (keys.length === 1) return keys[0];
   }
   return undefined;
 }
