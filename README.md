@@ -66,3 +66,42 @@ To configure Zoho Apptics MCP, you need to provide oauth credentials (client id,
 | `get_active_devices` | Reports active devices grouped by platform/device type/app version within the requested date range. |
 | `get_crash_detail` | Fetches detailed metadata, stack trace, and context for a specific crash using its `uniqueId`. |
 | `get_device_specific_crash_distribution` | Breaks down crash impact by device model for the given crash, with optional pagination and app-version filters. |
+| `fetch_apptics_config_by_bundle_id` | Fetches Apptics configuration (apptics-config.plist content) for a given iOS bundle ID. |
+
+## iOS SDK Integration Tools
+
+This MCP server also automates Apptics iOS SDK setup inside Xcode projects.
+
+- **`integrate_apptics_ios_sdk`** (default SPM): Adds the Apptics package, config file, disables user script sandboxing, injects imports + initialization, creates `AppticsManager.swift`, and links targets. Accepts `projectPath` and optional `targetNames` (`"all"` or specific target names).
+- **`switch_apptics_dependency`**: Swap Apptics dependency between SPM and CocoaPods. Preserves optional modules and third-party dependencies in both directions.
+
+For detailed procedures, parameters, and examples for both integration and switching, see **[IOS_SDK_PROCEDURES.md](src/tools/IOS_SDK_PROCEDURES.md)**.
+
+Example MCP call (SPM, all targets):
+```json
+{
+  "projectPath": "/absolute/path/to/YourApp",
+  "packageManager": "spm",
+  "targetNames": "all",
+  "verbose": true,
+  "createAppticsManagerFile": true,
+  "useAppticsManagerWrapper": true
+}
+```
+
+Notes:
+- The pre-build script now declares an output marker (`$(DERIVED_FILE_DIR)/AppticsPreBuild.marker`) so Xcode skips reruns and avoids the "run during every build" warning, including multi-target projects.
+- If auto-detection ever fails, you can optionally supply `appDelegatePath` or `swiftUIAppPath`, but this is rarely needed.
+- **Build folder in project:** Integration runs a build verification step (xcodebuild). Verification uses a temp derived-data path to avoid creating `build/` in the project; if `build/` still appears, add `build/` to `.gitignore` and delete the folder if desired.
+
+## Automatic Failure Reporting
+
+When SDK integration fails, the tool generates a detailed failure report saved to your project directory. The report includes:
+
+- **Categorized error types** (Prerequisites Missing, Build Failed, Configuration Error, etc.)
+- **Steps completed** and **steps failed** with detailed messages
+- **Environment information** (Xcode, CocoaPods, Swift versions)
+- **Build output** (for build verification failures)
+- **Actionable suggestions** for fixing the issue
+
+**Example:** `apptics-integration-failure-1706123456789.json`

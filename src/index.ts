@@ -2,7 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
-import { getAppticsClient } from "./appticsConfig";
+import { getAppticsClient } from "./appticsConfig.js";
+import { registerSdkIntegrationTools } from "./tools/sdkIntegrationTools.js";
 
 const server = new McpServer({
   name: "zoho-apptics",
@@ -17,7 +18,7 @@ server.registerTool("get_portals_and_projects_list", {
   const appticsClient = getAppticsClient();
   const result = await appticsClient.getPortalsAndProjects();
   return {
-    content: [{type: 'text', text: JSON.stringify(result)}]
+    content: [{type: 'text' as const, text: JSON.stringify(result)}]
   };
 });
 
@@ -235,7 +236,8 @@ Defaults to all versions when omitted.`
     }
   });
 
-
+// Register SDK integration tools
+registerSdkIntegrationTools(server);
 
 const transport = new StdioServerTransport();
 (async () => {

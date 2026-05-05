@@ -35,6 +35,16 @@ export class AppticsNetworkClient {
     this.accessToken = null;
   }
 
+  /** Base URI for Apptics API (e.g. for use by wrappers like AppticsSdkConfigClient). */
+  getAppticsUri(): string {
+    return this.appticsUri;
+  }
+
+  /** Resolved OAuth token (e.g. for use by wrappers like AppticsSdkConfigClient). */
+  async getAuthToken(): Promise<string> {
+    return this.getAccessToken();
+  }
+
   private formatDate(date: Date): string {
     const day = String(date.getDate()).padStart(2, "0");
     const month = String(date.getMonth() + 1).padStart(2, "0");
