@@ -1,6 +1,8 @@
 # Apptics MCP Server
 
-Model Context Protocol (MCP) server for Zoho Apptics analytics. The package authenticates with Zoho, refreshes OAuth tokens on demand, and exposes tools for querying portals, crash lists, crash trends, and active device data from Apptics.
+Model Context Protocol (MCP) server for Zoho Apptics analytics. The package exposes tools for querying portals, crash lists, crash trends, and active device data from Apptics, as well as listing applications and downloading their SDK config files.
+
+> **Note:** Apptics tools are also available through the [Zoho Remote MCP Server](https://www.zoho.com/mcp/), which supports more capabilities (hosted auth, access to the wider Zoho tool ecosystem, etc.). This package is a developer-oriented standalone stdio MCP server — use it when you want to run Apptics tooling locally with your own OAuth credentials.
 
 ## Prerequisites
 - Node.js 18 or newer.
