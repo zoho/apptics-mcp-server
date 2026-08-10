@@ -6,7 +6,7 @@ import { getAppticsClient } from "./appticsConfig.js";
 
 const server = new McpServer({
   name: "zoho-apptics",
-  version: "1.0.0"
+  version: "0.3.1"
 });
 
 server.registerTool("get_portals_and_projects_list", {
