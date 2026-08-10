@@ -3,7 +3,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { getAppticsClient } from "./appticsConfig.js";
-import { registerSdkIntegrationTools } from "./tools/sdkIntegrationTools.js";
 
 const server = new McpServer({
   name: "zoho-apptics",
@@ -236,8 +235,45 @@ Defaults to all versions when omitted.`
     }
   });
 
-// Register SDK integration tools
-registerSdkIntegrationTools(server);
+server.registerTool("list_applications", {
+  description: `
+  List all applications registered under a specific project.
+
+The response data is keyed by application identifier (aaid). Each application includes its
+bundle/package identifier, platform brand (e.g. "Apple", "Android"), type, and aaid.
+
+Use this to discover the aaid of an application before downloading its config file
+with download_config_file.`,
+  inputSchema: {
+    portalId: z.string().describe("Portal identifier (zsoid) of the portal to which the project belongs."),
+    projectId: z.string().describe("Project identifier within the specified portal.")
+  }
+}, async ({ portalId, projectId }) => {
+  const appticsClient = getAppticsClient();
+  const result = await appticsClient.getApplications(projectId, portalId);
+  return {
+    content: [{ type: 'text', text: JSON.stringify(result) }]
+  };
+});
+
+server.registerTool("download_config_file", {
+  description: `
+  Download the Apptics SDK configuration file for a specific application.
+
+Requires the application identifier (aaid), which can be obtained from list_applications.
+Returns the raw config file content (e.g. apptics-config.plist XML for iOS apps).`,
+  inputSchema: {
+    portalId: z.string().describe("Portal identifier (zsoid) of the portal to which the project belongs."),
+    projectId: z.string().describe("Project identifier within the specified portal."),
+    aaid: z.number().describe("Application identifier (aaid). Obtain this from the list_applications tool.")
+  }
+}, async ({ portalId, projectId, aaid }) => {
+  const appticsClient = getAppticsClient();
+  const content = await appticsClient.downloadConfigFile(projectId, portalId, aaid);
+  return {
+    content: [{ type: 'text', text: content }]
+  };
+});
 
 const transport = new StdioServerTransport();
 (async () => {
