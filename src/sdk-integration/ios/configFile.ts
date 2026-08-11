@@ -4,6 +4,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { linkFileToXcodeProject } from './universalFileLinker';
 import { fileExists, findPbxprojFile } from './utils';
+import { resolveContainedPath } from '../pathContainment';
 import { normalizeTargets } from './pbxprojUtils';
 import { isFileSystemSyncedProject } from './xcodeProjectParser';
 import {
@@ -176,7 +177,8 @@ export async function addAppticsConfigFile(params: {
     targetNames
   } = params;
 
-  const destPath = path.join(projectPath, configFileName);
+  // Canonicalize the destination and refuse to follow symlinks that escape the project.
+  const destPath = await resolveContainedPath(projectPath, configFileName);
 
   try {
     const normalizedSource = path.resolve(configFileSource);
@@ -312,7 +314,12 @@ export async function addAppticsManagerWrapper(params: {
         ? path.basename(outputPath)
         : APPTICS_MANAGER_FILENAME;
 
-      const existingManagerPath = path.join(projectPath, folderRelativeToProject, effectiveFileName);
+      // Canonicalize the manager path and refuse to follow symlinks (e.g. a symlinked
+      // `AppticsManager` directory) that would redirect the write outside the project.
+      const existingManagerPath = await resolveContainedPath(
+        projectPath,
+        path.join(folderRelativeToProject, effectiveFileName)
+      );
       const managerExists = await fileExists(existingManagerPath);
 
       let managerTemplate = APPTICS_MANAGER_TEMPLATE;
@@ -325,7 +332,7 @@ export async function addAppticsManagerWrapper(params: {
         .replace(APPTICS_MANAGER_PLACEHOLDER_IMPORTS, optionalImports)
         .replace(APPTICS_MANAGER_PLACEHOLDER_EXTENSIONS, optionalExtensions);
 
-    await fs.mkdir(path.join(projectPath, folderRelativeToProject), { recursive: true });
+    await fs.mkdir(path.dirname(existingManagerPath), { recursive: true });
     const shouldWriteManager =
       !managerExists || overwrite || optionalIds.length > 0;
     if (shouldWriteManager) {
@@ -381,7 +388,7 @@ export async function addAppticsManagerWrapper(params: {
       };
     } catch (err) {
       // Fallback: keep file on disk even if linking fails
-      await fs.mkdir(path.join(projectPath, folderRelativeToProject), { recursive: true });
+      await fs.mkdir(path.dirname(existingManagerPath), { recursive: true });
       await fs.writeFile(existingManagerPath, managerTemplate, 'utf-8');
       return {
         success: true,
@@ -463,7 +470,8 @@ export async function setupMultiEnvironmentConfig(params: {
   try {
     for (const env of environments) {
       const configFileName = `apptics-config-${env.name}.plist`;
-      const destPath = path.join(projectPath, configFileName);
+      // Canonicalize the destination and refuse to follow symlinks escaping the project.
+      const destPath = await resolveContainedPath(projectPath, configFileName);
       await fs.copyFile(env.configFileSource, destPath);
       configured.push(env.name);
     }

@@ -5,14 +5,22 @@ import { findPbxprojFile, openProject, getNativeTargets } from './utils';
 
 const execFileAsync = promisify(execFile);
 
+/** Platform for Apple projects (iOS or macOS). */
+export type ApplePlatform = 'ios' | 'macos';
+
 /**
  * Extract build settings from Xcode project using Ruby xcodeproj library.
+ * Detects platform (iOS vs macOS) from SDKROOT/SUPPORTED_PLATFORMS and returns
+ * the appropriate deployment target.
  */
 export async function getBuildSettings(
   projectPath: string,
   targetName?: string
 ): Promise<{
+  platform: ApplePlatform;
+  deploymentTarget: string;
   iosDeploymentTarget?: string;
+  macosDeploymentTarget?: string;
   swiftVersion?: string;
   objectVersion?: string;
 }> {
@@ -29,27 +37,53 @@ export async function getBuildSettings(
     project = Xcodeproj::Project.open(proj_path)
     
     result = {
-      object_version: project.object_version
+      object_version: project.object_version,
+      ios_deployment_target: nil,
+      macos_deployment_target: nil,
+      swift_version: nil,
+      sdk_root: nil,
+      supported_platforms: nil
     }
     
-    # Get build settings from project level
+    targets_to_check = []
+    if target_name && !target_name.empty?
+      t = project.targets.find { |x| x.name == target_name }
+      targets_to_check = t ? [t] : project.targets
+    else
+      targets_to_check = project.targets
+    end
+    
+    targets_to_check.each do |target|
+      next unless target.respond_to?(:build_configurations)
+      target.build_configurations.each do |config|
+        settings = config.build_settings
+        result[:ios_deployment_target] ||= settings['IPHONEOS_DEPLOYMENT_TARGET']
+        result[:macos_deployment_target] ||= settings['MACOSX_DEPLOYMENT_TARGET']
+        result[:swift_version] ||= settings['SWIFT_VERSION']
+        result[:sdk_root] ||= settings['SDKROOT']
+        result[:supported_platforms] ||= settings['SUPPORTED_PLATFORMS']
+      end
+    end
+    
     project.build_configurations.each do |config|
       settings = config.build_settings
       result[:ios_deployment_target] ||= settings['IPHONEOS_DEPLOYMENT_TARGET']
+      result[:macos_deployment_target] ||= settings['MACOSX_DEPLOYMENT_TARGET']
       result[:swift_version] ||= settings['SWIFT_VERSION']
+      result[:sdk_root] ||= settings['SDKROOT']
+      result[:supported_platforms] ||= settings['SUPPORTED_PLATFORMS']
     end
     
-    # If target specified, get target-specific settings
-    if target_name && !target_name.empty?
-      target = project.targets.find { |t| t.name == target_name }
-      if target
-        target.build_configurations.each do |config|
-          settings = config.build_settings
-          result[:ios_deployment_target] ||= settings['IPHONEOS_DEPLOYMENT_TARGET']
-          result[:swift_version] ||= settings['SWIFT_VERSION']
-        end
-      end
+    # Detect platform: macosx SDK or macosx in SUPPORTED_PLATFORMS => macOS
+    is_macos = false
+    sdk = (result[:sdk_root] || '').to_s.downcase
+    plat = result[:supported_platforms]
+    plat_str = plat.is_a?(Array) ? plat.join(' ').downcase : (plat || '').to_s.downcase
+    if sdk.include?('macosx') || plat_str.include?('macosx')
+      is_macos = true
     end
+    result[:platform] = is_macos ? 'macos' : 'ios'
+    result[:deployment_target] = is_macos ? (result[:macos_deployment_target] || '10.15') : (result[:ios_deployment_target] || '13.0')
     
     puts JSON.generate(result)
   `;
@@ -62,7 +96,10 @@ export async function getBuildSettings(
 
     const result = JSON.parse(stdout.trim());
     return {
+      platform: result.platform,
+      deploymentTarget: result.deployment_target,
       iosDeploymentTarget: result.ios_deployment_target,
+      macosDeploymentTarget: result.macos_deployment_target,
       swiftVersion: result.swift_version,
       objectVersion: result.object_version
     };

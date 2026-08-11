@@ -14,7 +14,14 @@ export const MIN_XCODE_VERSION = '9.0';
 export const MIN_COCOAPODS_VERSION = '1.5.3';
 /** Default minimum iOS for Apptics CocoaPods integration (e.g. AppticsMessaging requires 13.0). */
 export const MIN_IOS_DEPLOYMENT_TARGET = '13.0';
+/** Default minimum macOS for Apptics CocoaPods integration. */
+export const MIN_MACOS_DEPLOYMENT_TARGET = '10.15';
 export const MIN_SWIFT_VERSION = '4.0';
+
+/** Get minimum deployment target for the given Apple platform. */
+export function getMinDeploymentTarget(platform: 'ios' | 'macos'): string {
+  return platform === 'macos' ? MIN_MACOS_DEPLOYMENT_TARGET : MIN_IOS_DEPLOYMENT_TARGET;
+}
 
 export async function listAllNativeTargets(projectPath: string): Promise<string[]> {
   const pbxprojPath = await findPbxprojFile(projectPath);

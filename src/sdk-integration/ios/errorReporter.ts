@@ -3,6 +3,7 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { getToolVersions, getBuildSettings } from './xcodeProjectParser';
+import { resolveContainedPath } from '../pathContainment';
 
 const execAsync = promisify(exec);
 
@@ -160,10 +161,10 @@ export function generateSuggestions(category: IntegrationErrorCategory, error: I
       break;
 
     case IntegrationErrorCategory.CONFIGURATION_ERROR:
-      suggestions.push('Verify the bundle ID is registered in Apptics Console (https://apptics.zoho.com)');
-      suggestions.push('Ensure the bundle ID matches an iOS/Apple app (not Android)');
-      suggestions.push('Check that apptics-config.plist exists or can be downloaded');
-      suggestions.push('Use alternateBundleId parameter if your project bundle ID differs from registered app');
+      suggestions.push('If apptics-config.plist is missing, first list portals/projects and select one project explicitly');
+      suggestions.push('Then list iOS apps for that project and choose one appAaid explicitly');
+      suggestions.push('Rerun integration with portalId, projectId, and appAaid');
+      suggestions.push('Check that apptics-config.plist exists locally or can be downloaded from the selected app');
       break;
 
     case IntegrationErrorCategory.PROJECT_FILE_CORRUPTION:
@@ -274,10 +275,10 @@ export async function generateFailureReport(params: {
     suggestions
   };
 
-  // Save report to project directory
+  // Save report to project directory (containment guard: never write through an escaping symlink).
   const reportFileName = `apptics-integration-failure-${Date.now()}.json`;
-  const reportPath = path.join(projectPath, reportFileName);
-  
+  const reportPath = await resolveContainedPath(projectPath, reportFileName);
+
   await fs.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf-8');
 
   return { reportPath, report };

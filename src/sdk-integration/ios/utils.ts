@@ -5,6 +5,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import xcode from 'xcode';
+import { resolveContainedPath } from '../pathContainment';
 
 export interface ParsedXcodeProject {
   project: any;
@@ -46,12 +47,14 @@ export async function findPbxprojFile(projectPath: string): Promise<string> {
   
   const entries = await fs.readdir(projectPath);
   const xcodeproj = entries.find(f => f.endsWith('.xcodeproj'));
-  
+
   if (!xcodeproj) {
     throw new Error(`No .xcodeproj found under ${projectPath}`);
   }
-  
-  return path.join(projectPath, xcodeproj, 'project.pbxproj');
+
+  // Containment guard: refuse a .xcodeproj that is a symlink escaping the project directory,
+  // so pbxproj writes and Ruby xcodeproj operations cannot be redirected outside (CWE-59).
+  return resolveContainedPath(projectPath, path.join(xcodeproj, 'project.pbxproj'));
 }
 
 /**

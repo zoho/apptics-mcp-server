@@ -139,8 +139,13 @@ export async function addSPMPackage(params: {
     const xcodeprojPath = pbxprojPath.replace(/\/project\.pbxproj$/, '');
     const xcodeprojName = path.basename(xcodeprojPath);
     const workspacePath = path.dirname(xcodeprojPath);
-    const resolveCmd = `cd "${workspacePath}" && xcodebuild -project "${xcodeprojName}" -resolvePackageDependencies 2>&1`;
-    const { stderr } = await execAsync(resolveCmd, { timeout: 180000 });
+    // execFile with an argument array (no shell): the project name is passed as a discrete
+    // arg and cwd handles the directory, so shell metacharacters cannot be injected (CWE-78).
+    const { stderr } = await execFileAsync(
+      'xcodebuild',
+      ['-project', xcodeprojName, '-resolvePackageDependencies'],
+      { cwd: workspacePath, timeout: 180000 }
+    ) as { stdout: string; stderr: string };
     if (!stderr || (!stderr.includes('error') && !stderr.includes('Error'))) {
       resolutionSucceeded = true;
     }

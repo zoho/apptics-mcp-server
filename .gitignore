@@ -5,3 +5,7 @@ node_modules
 .env.*
 dist
 npm-debug.log*
+package-lock.json
+
+# Reference / internal docs (not committed)
+reference/
