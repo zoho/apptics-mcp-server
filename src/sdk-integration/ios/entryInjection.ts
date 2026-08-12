@@ -2,8 +2,10 @@ import * as fs from 'fs/promises';
 import { AppticsInitConfig, AppEntryPoint } from './pbxprojUtils';
 import { parseSwiftFile, parseObjectiveCFile } from './swiftParser';
 import { getOptionalModules } from './appticsOptionalModules';
+import { resolveContainedPath } from '../pathContainment';
 
 export async function addAppticsImport(params: {
+  projectPath: string;
   entryFilePath: string;
   language: 'swift' | 'objc';
   packageManager?: 'cocoapods' | 'spm';
@@ -11,10 +13,14 @@ export async function addAppticsImport(params: {
   /** Optional module ids: add their import lines after the last import. */
   optionalModuleIds?: string[];
 }) {
-  const { entryFilePath, language, packageManager = 'spm', spmProductName, optionalModuleIds } = params;
+  const { projectPath, entryFilePath, language, packageManager = 'spm', spmProductName, optionalModuleIds } = params;
 
   try {
-    let content = await fs.readFile(entryFilePath, 'utf-8');
+    // Resolve the entry file to a canonical, containment-checked path and use THAT for the
+    // read and the write (no re-opening by original name), so a symlink swap between check
+    // and write cannot redirect the injection outside the project (CWE-59, TOCTOU).
+    const safeEntryPath = await resolveContainedPath(projectPath, entryFilePath);
+    let content = await fs.readFile(safeEntryPath, 'utf-8');
     
     const moduleName = packageManager === 'spm' 
       ? (spmProductName || 'Apptics')
@@ -67,7 +73,7 @@ export async function addAppticsImport(params: {
     }
 
     if (modified) {
-      await fs.writeFile(entryFilePath, content, 'utf-8');
+      await fs.writeFile(safeEntryPath, content, 'utf-8');
     }
 
     return {
@@ -81,6 +87,7 @@ export async function addAppticsImport(params: {
 }
 
 export async function addAppticsInitialization(params: {
+  projectPath: string;
   entryFilePath: string;
   language: 'swift' | 'objc';
   entryPoint?: AppEntryPoint;
@@ -92,6 +99,7 @@ export async function addAppticsInitialization(params: {
   optionalModuleIds?: string[];
 }) {
   const {
+    projectPath,
     entryFilePath,
     language,
     entryPoint = 'appDelegate',
@@ -110,14 +118,17 @@ export async function addAppticsInitialization(params: {
   }
 
   try {
-    let content = await fs.readFile(entryFilePath, 'utf-8');
-    
+    // Canonical, containment-checked path used for every read and write below, so the
+    // injection cannot be redirected outside the project by a symlink swap (CWE-59, TOCTOU).
+    const safeEntryPath = await resolveContainedPath(projectPath, entryFilePath);
+    let content = await fs.readFile(safeEntryPath, 'utf-8');
+
     let hasInitialization = false;
     if (language === 'objc') {
-      const parsed = await parseObjectiveCFile(entryFilePath);
+      const parsed = await parseObjectiveCFile(safeEntryPath);
       hasInitialization = parsed.initialization.hasAppticsInitialization;
     } else {
-      const parsed = await parseSwiftFile(entryFilePath);
+      const parsed = await parseSwiftFile(safeEntryPath);
       hasInitialization = parsed.initialization.hasAppticsInitialization || 
                          parsed.initialization.hasAppticsManagerConfiguration;
     }
@@ -132,7 +143,7 @@ export async function addAppticsInitialization(params: {
 
     if (hasInitialization && optionalModuleIds && optionalModuleIds.length > 0) {
       content = injectOptionalConfigLines(content, language, optionalModuleIds);
-      await fs.writeFile(entryFilePath, content, 'utf-8');
+      await fs.writeFile(safeEntryPath, content, 'utf-8');
       return {
         success: true,
         initializationAdded: false,
@@ -209,7 +220,7 @@ export async function addAppticsInitialization(params: {
       content = content.slice(0, methodBodyStart + 1) + initCode + content.slice(methodBodyStart + 1);
     }
 
-    await fs.writeFile(entryFilePath, content, 'utf-8');
+    await fs.writeFile(safeEntryPath, content, 'utf-8');
 
     return {
       success: true,

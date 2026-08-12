@@ -4,12 +4,13 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { findPbxprojFile, fileExists } from '../../sdk-integration/ios/utils';
 import type { BackupPaths, BuildValidationResult } from './types';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /**
  * Create backups of Podfile and project.pbxproj
@@ -59,17 +60,21 @@ export async function validateBuildAfterSwitch(
   const errors: string[] = [];
   const warnings: string[] = [];
   let buildCommand: string | undefined;
-  
+  // xcodebuild args as an array (execFile, no shell): project/workspace names are untrusted
+  // (attacker-controlled repo layout) and must never be interpreted by a shell (CWE-78).
+  let buildArgs: string[] | undefined;
+
   try {
     // Determine which file to use for build
     let buildFile: string;
-    
+
     if (switchedTo === 'cocoapods') {
       // Look for .xcworkspace
       const entries = await fs.readdir(resolvedPath);
       const workspace = entries.find(e => e.endsWith('.xcworkspace'));
       if (workspace) {
         buildFile = path.join(resolvedPath, workspace);
+        buildArgs = ['-workspace', workspace, '-list'];
         buildCommand = `xcodebuild -workspace "${workspace}" -list`;
       } else {
         warnings.push('No .xcworkspace found - CocoaPods may not be properly installed. Run "pod install".');
@@ -77,6 +82,7 @@ export async function validateBuildAfterSwitch(
         const xcodeproj = entries.find(e => e.endsWith('.xcodeproj'));
         if (xcodeproj) {
           buildFile = path.join(resolvedPath, xcodeproj);
+          buildArgs = ['-project', xcodeproj, '-list'];
           buildCommand = `xcodebuild -project "${xcodeproj}" -list`;
         } else {
           errors.push('No .xcodeproj or .xcworkspace found');
@@ -89,30 +95,33 @@ export async function validateBuildAfterSwitch(
       const xcodeproj = entries.find(e => e.endsWith('.xcodeproj'));
       if (xcodeproj) {
         buildFile = path.join(resolvedPath, xcodeproj);
+        buildArgs = ['-project', xcodeproj, '-list'];
         buildCommand = `xcodebuild -project "${xcodeproj}" -list`;
       } else {
         errors.push('No .xcodeproj found');
         return { valid: false, errors, warnings: warnings.length > 0 ? warnings : undefined, buildCommand };
       }
     }
-    
+
     // Run xcodebuild -list to verify project structure
     try {
-      const { stdout, stderr } = await execAsync(
-        `cd "${resolvedPath}" && ${buildCommand}`,
-        { timeout: 30000 }
-      );
-      
+      const { stdout, stderr } = await execFileAsync('xcodebuild', buildArgs, {
+        cwd: resolvedPath,
+        timeout: 30000
+      }) as { stdout: string; stderr: string };
+
       if (stderr && !stdout) {
         warnings.push(`xcodebuild -list produced warnings: ${stderr.slice(0, 200)}`);
       }
-      
+
       // For SPM, also try to resolve packages
       if (switchedTo === 'spm') {
         try {
           const xcodeprojName = path.basename(buildFile);
-          const resolveCmd = `cd "${resolvedPath}" && xcodebuild -project "${xcodeprojName}" -resolvePackageDependencies 2>&1`;
-          await execAsync(resolveCmd, { timeout: 60000 });
+          await execFileAsync('xcodebuild', ['-project', xcodeprojName, '-resolvePackageDependencies'], {
+            cwd: resolvedPath,
+            timeout: 60000
+          });
         } catch (resolveError: any) {
           warnings.push(`Package resolution warning: ${resolveError.message?.slice(0, 200) || 'Unknown error'}`);
           // Don't fail validation for package resolution issues

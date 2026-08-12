@@ -7,6 +7,9 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { fileExists } from '../../sdk-integration/ios/utils';
+import { getBuildSettings } from '../../sdk-integration/ios/xcodeProjectParser';
+import { getMinDeploymentTarget } from '../../sdk-integration/ios/pbxprojUtils';
+import type { ApplePlatform } from '../../sdk-integration/ios/xcodeProjectParser';
 import type { IOSLanguage } from './types';
 
 const execFileAsync = promisify(execFile);
@@ -87,6 +90,122 @@ function contentHasPod(content: string, podName: string): boolean {
   return lower.includes("pod '" + p + "'") || lower.includes('pod "' + p + '"');
 }
 
+/** Determine a :source suffix for Apptics pods when Podfile uses source_url. */
+function getAppticsPodSourceSuffix(content: string): string {
+  const hasSourceVar = content.includes('source_url =');
+  const usesSourceVar =
+    content.includes('Apptics-SDK/Scripts') && content.includes(':source => source_url');
+  if (hasSourceVar && usesSourceVar) {
+    return ', :source => source_url';
+  }
+  return '';
+}
+
+/** Ensure Podfile has a platform line (non-comment). Supports :ios and :osx (macOS). */
+function ensurePlatformLine(content: string, platform: ApplePlatform, defaultVersion: string): string {
+  const lines = splitLines(content);
+  let hasPlatform = false;
+  let firstTargetIdx = -1;
+  let lastSourceIdx = -1;
+  const podPlatform = platform === 'macos' ? ':osx' : ':ios';
+  for (let i = 0; i < lines.length; i++) {
+    const t = (lines[i] ?? '').trim();
+    if (t.startsWith('#')) continue;
+    if (t.startsWith('platform ') && (t.includes(':ios') || t.includes(':osx'))) {
+      hasPlatform = true;
+      break;
+    }
+    if (firstTargetIdx < 0 && t.startsWith('target ')) {
+      firstTargetIdx = i;
+    }
+    if (t.startsWith('source ')) {
+      lastSourceIdx = i;
+    }
+  }
+  if (hasPlatform) return content;
+  const insertAt = lastSourceIdx >= 0 ? lastSourceIdx + 1 : (firstTargetIdx >= 0 ? firstTargetIdx : 0);
+  lines.splice(insertAt, 0, `platform ${podPlatform}, '${defaultVersion}'`, '');
+  return lines.join('\n');
+}
+
+/** Add :source => source_url to Apptics pods inside a target block when missing. */
+function addSourceSuffixToAppticsPodsInTarget(
+  lines: string[],
+  targetStartIdx: number,
+  suffix: string
+): void {
+  if (!suffix) return;
+  for (let i = targetStartIdx + 1; i < lines.length; i++) {
+    const t = (lines[i] ?? '').trim();
+    if (t === 'end') break;
+    if (t.startsWith('target ')) break;
+    if (t.startsWith('abstract_target ')) break;
+    if (t.startsWith('pod ') && t.includes('Apptics') && !t.includes(':source =>')) {
+      lines[i] = `${lines[i]}${suffix}`;
+    }
+  }
+}
+
+/** Check if the target block already contains an Apptics script_phase. */
+function targetHasAppticsScriptPhase(lines: string[], targetStartIdx: number): boolean {
+  for (let i = targetStartIdx + 1; i < lines.length; i++) {
+    const t = (lines[i] ?? '').trim();
+    if (t === 'end') break;
+    if (t.startsWith('target ')) break;
+    if (t.startsWith('abstract_target ')) break;
+    if (t.startsWith('script_phase') && t.toLowerCase().includes('apptics')) return true;
+  }
+  return false;
+}
+
+/** Remove duplicate Apptics script_phase lines within a target block (keep first). */
+function dedupeAppticsScriptPhases(lines: string[], targetStartIdx: number): void {
+  const idxs: number[] = [];
+  for (let i = targetStartIdx + 1; i < lines.length; i++) {
+    const t = (lines[i] ?? '').trim();
+    if (t === 'end') break;
+    if (t.startsWith('target ')) break;
+    if (t.startsWith('abstract_target ')) break;
+    if (t.startsWith('script_phase') && t.toLowerCase().includes('apptics')) {
+      idxs.push(i);
+    }
+  }
+  if (idxs.length <= 1) return;
+  // Remove duplicates from bottom to top, keep the first occurrence.
+  for (let i = idxs.length - 1; i >= 1; i--) {
+    lines.splice(idxs[i]!, 1);
+  }
+}
+
+/** Remove duplicate Apptics script phases across all target blocks. */
+function dedupeAppticsScriptPhasesInAllTargets(lines: string[]): void {
+  for (let i = 0; i < lines.length; i++) {
+    const t = (lines[i] ?? '').trim();
+    if (t.startsWith('target ')) {
+      dedupeAppticsScriptPhases(lines, i);
+    }
+  }
+}
+
+/**
+ * Remove duplicate Apptics script phases in a Podfile (keep first per target).
+ * Useful for recovering from invalid Podfile errors before pod install.
+ */
+export async function dedupeAppticsScriptPhasesInPodfile(podfilePath: string): Promise<void> {
+  const resolved = path.resolve(podfilePath);
+  if (!(await fileExists(resolved))) {
+    return;
+  }
+  const content = await fs.readFile(resolved, 'utf-8');
+  const lines = splitLines(content);
+  dedupeAppticsScriptPhasesInAllTargets(lines);
+  const cleaned = lines.join('\n');
+  if (cleaned !== content) {
+    await fs.writeFile(resolved, cleaned, 'utf-8');
+  }
+}
+
+
 /**
  * Add Apptics pods via line-by-line text editing. No regex. Preserves post_install,
  * use_frameworks!, inhibit_all_warnings!, def blocks, and script phases.
@@ -114,6 +233,12 @@ async function addAppticsPodToPodfileTextBased(
     }
   }
 
+  // Ensure platform line exists (prevents CocoaPods warning -> failure in some envs)
+  const projectDir = path.dirname(podfilePath);
+  const buildSettings = await getBuildSettings(projectDir);
+  const defaultVersion = buildSettings.deploymentTarget ?? getMinDeploymentTarget(buildSettings.platform);
+  content = ensurePlatformLine(content, buildSettings.platform, defaultVersion);
+
   const mainPods = podNamesToAdd.filter(
     (p) => !EXTENSION_PODS.has(p.toLowerCase())
   );
@@ -124,10 +249,11 @@ async function addAppticsPodToPodfileTextBased(
     podNamesToAdd.find((p) => p.toLowerCase() === 'appticsextension') ||
     (hasExtensionPod ? 'AppticsExtension' : null);
   const versionExpr = hasAppticsVersion ? '$apptics_version' : "'3.3.9'";
+  const podSourceSuffix = getAppticsPodSourceSuffix(content);
 
   // Find main app target: exclude intents, widgets, extensions, tests.
   // Prefer the first target that actually exists in the Podfile.
-  const excludePatterns = ['intent', 'widget', 'extension', 'uitest', 'unittest', 'test'];
+  const excludePatterns = ['intent', 'widget', 'extension', 'uitest', 'unittest'];
   const candidates = targetNames.filter(
     (t) => !excludePatterns.some((p) => t.toLowerCase().includes(p))
   );
@@ -145,25 +271,38 @@ async function addAppticsPodToPodfileTextBased(
 
   const mainTargetAlreadyHasApptics = mainPods.some((p) => contentHasPod(content, p));
 
+  // Clean up duplicate Apptics script phases (if any) before inserting.
+  dedupeAppticsScriptPhasesInAllTargets(lines);
+
+  // Find main target line index (if present).
+  let mainTargetLineIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (isTargetDoLine(lines[i] ?? '', mainTargetName)) {
+      mainTargetLineIdx = i;
+      break;
+    }
+  }
+
+  if (mainTargetLineIdx >= 0) {
+    // Clean up duplicate Apptics script phases before any edits.
+    dedupeAppticsScriptPhases(lines, mainTargetLineIdx);
+    // Ensure existing Apptics pods use the same source (if required).
+    addSourceSuffixToAppticsPodsInTarget(lines, mainTargetLineIdx, podSourceSuffix);
+    content = lines.join('\n');
+  }
+
   // Insert main Apptics pods into the main app target
-  if (mainPods.length > 0 && !mainTargetAlreadyHasApptics) {
-    let mainTargetLineIdx = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (isTargetDoLine(lines[i] ?? '', mainTargetName)) {
-        mainTargetLineIdx = i;
-        break;
-      }
-    }
-    if (mainTargetLineIdx >= 0) {
-      const podLines = mainPods
-        .map((p) => `    pod '${p}', ${versionExpr}`)
-        .join('\n');
-      const scriptPhase =
-        '    script_phase :name => \'Apptics pre build\', :script => \'sh "./Pods/Apptics-SDK/scripts/run" --upload-symbols-for-configurations="Release, Appstore" --config-file-path="${ZA_APPTICS_PATH}" --app-group-identifier="${ZA_WIDGET_APP_GROUP_ID}"\', :execution_position => :before_compile';
-      const toInsert = `${podLines}\n${scriptPhase}`;
-      lines.splice(mainTargetLineIdx + 1, 0, toInsert);
-      content = lines.join('\n');
-    }
+  if (mainPods.length > 0 && !mainTargetAlreadyHasApptics && mainTargetLineIdx >= 0) {
+    const podLines = mainPods
+      .map((p) => `    pod '${p}', ${versionExpr}${podSourceSuffix}`)
+      .join('\n');
+    const scriptPhase =
+      '    script_phase :name => \'Apptics pre build\', :script => \'sh "./Pods/Apptics-SDK/scripts/run" --upload-symbols-for-configurations="Release, Appstore" --config-file-path="${ZA_APPTICS_PATH}" --app-group-identifier="${ZA_WIDGET_APP_GROUP_ID}"\', :execution_position => :before_compile';
+    const toInsert = targetHasAppticsScriptPhase(lines, mainTargetLineIdx)
+      ? `${podLines}`
+      : `${podLines}\n${scriptPhase}`;
+    lines.splice(mainTargetLineIdx + 1, 0, toInsert);
+    content = lines.join('\n');
   }
 
   // Insert AppticsExtension into def extension_common
@@ -177,6 +316,13 @@ async function addAppticsPodToPodfileTextBased(
         break;
       }
     }
+  }
+
+  // Final cleanup: remove duplicate Apptics script phases after all edits.
+  {
+    const finalLines = splitLines(content);
+    dedupeAppticsScriptPhasesInAllTargets(finalLines);
+    content = finalLines.join('\n');
   }
 
   await fs.writeFile(podfilePath, content, 'utf-8');
@@ -200,6 +346,17 @@ export async function addAppticsPodToPodfile(
   const projectDir = path.dirname(resolved);
   const exists = await fileExists(resolved);
 
+  // If Podfile exists, dedupe Apptics script phases before any edits.
+  if (exists) {
+    const original = await fs.readFile(resolved, 'utf-8');
+    const lines = splitLines(original);
+    dedupeAppticsScriptPhasesInAllTargets(lines);
+    const cleaned = lines.join('\n');
+    if (cleaned !== original) {
+      await fs.writeFile(resolved, cleaned, 'utf-8');
+    }
+  }
+
   // Use text-based editing when Podfile has structure we must preserve
   if (exists && podNamesToAdd && podNamesToAdd.length > 0) {
     const content = await fs.readFile(resolved, 'utf-8');
@@ -214,9 +371,13 @@ export async function addAppticsPodToPodfile(
     }
   }
 
+  const buildSettings = await getBuildSettings(projectDir);
+  const platform = buildSettings.platform;
+  const deploymentVersion = buildSettings.deploymentTarget ?? getMinDeploymentTarget(platform);
+
   const podfileJson = exists
     ? await readPodfileJSON(resolved, projectDir)
-    : createBasePodfile(targetNames, podsToAdd[0] ?? sdkPod);
+    : createBasePodfile(targetNames, podsToAdd[0] ?? sdkPod, platform, deploymentVersion);
 
   // Flatten and remove duplicate Pods targets
   const flat: PodTargetDefinition[] = [];
@@ -241,18 +402,19 @@ export async function addAppticsPodToPodfile(
 
   // Ensure all targets exist
   const existingNames = new Set(podfileJson.target_definitions.map(d => d.name));
+  const platformKey = platform === 'macos' ? 'osx' : 'ios';
   for (const tname of targetNames) {
     if (!existingNames.has(tname)) {
       podfileJson.target_definitions.push({
         name: tname,
-        platform: { ios: '11.0' },
+        platform: { [platformKey]: deploymentVersion },
         uses_frameworks: true,
         dependencies: [...podsToAdd]
       });
     }
   }
 
-  await writePodfileJSON(resolved, projectDir, podfileJson);
+  await writePodfileJSON(resolved, projectDir, podfileJson, platform, deploymentVersion);
 }
   
 /**
@@ -361,13 +523,20 @@ export async function readPodfileJSON(podfilePath: string, cwd: string): Promise
   return JSON.parse(stdout) as PodfileJSON;
 }
 
-async function writePodfileJSON(podfilePath: string, cwd: string, podfile: PodfileJSON): Promise<void> {
+async function writePodfileJSON(
+  podfilePath: string,
+  cwd: string,
+  podfile: PodfileJSON,
+  platform: ApplePlatform,
+  deploymentVersion: string
+): Promise<void> {
   // CocoaPods 1.16.x does not support `pod ipc podfile-from-json`, so render manually.
-  const iosVersion =
-    podfile.target_definitions[0]?.children?.[0]?.platform?.ios ||
-    podfile.target_definitions[0]?.platform?.ios ||
-    '11.0';
-  const content = renderPodfile(podfile, iosVersion);
+  const platformKey = platform === 'macos' ? 'osx' : 'ios';
+  const version =
+    podfile.target_definitions[0]?.children?.[0]?.platform?.[platformKey] ||
+    podfile.target_definitions[0]?.platform?.[platformKey] ||
+    deploymentVersion;
+  const content = renderPodfile(podfile, platform, version);
   await fs.writeFile(podfilePath, content, 'utf-8');
 }
 
@@ -399,11 +568,13 @@ function dependencyName(dep: PodDependency): string | undefined {
   return undefined;
 }
 
-function renderPodfile(podfile: PodfileJSON, iosVersion: string): string {
+function renderPodfile(podfile: PodfileJSON, platform: ApplePlatform, deploymentVersion: string): string {
+  const podPlatform = platform === 'macos' ? ':osx' : ':ios';
+  const platformKey = platform === 'macos' ? 'osx' : 'ios';
   const lines: string[] = [];
   lines.push(`source 'https://github.com/CocoaPods/Specs.git'`);
   lines.push('');
-  lines.push(`platform :ios, '${iosVersion}'`);
+  lines.push(`platform ${podPlatform}, '${deploymentVersion}'`);
   lines.push('');
 
   const renderTarget = (def: PodTargetDefinition, indent: string) => {
@@ -412,8 +583,9 @@ function renderPodfile(podfile: PodfileJSON, iosVersion: string): string {
     if (def.uses_frameworks) {
       lines.push(`${inner}use_frameworks!`);
     }
-    if (def.platform?.ios) {
-      lines.push(`${inner}platform :ios, '${def.platform.ios}'`);
+    const defVersion = def.platform?.[platformKey];
+    if (defVersion) {
+      lines.push(`${inner}platform ${podPlatform}, '${defVersion}'`);
     }
     for (const dep of def.dependencies ?? []) {
       const name = dependencyName(dep);
@@ -452,10 +624,16 @@ function applyToTargets(defs: PodTargetDefinition[], fn: (target: PodTargetDefin
   });
   }
   
-function createBasePodfile(targetNames: string[], podName: string): PodfileJSON {
+function createBasePodfile(
+  targetNames: string[],
+  podName: string,
+  platform: ApplePlatform,
+  deploymentVersion: string
+): PodfileJSON {
+  const platformKey = platform === 'macos' ? 'osx' : 'ios';
   const defs = targetNames.map<PodTargetDefinition>((name) => ({
     name,
-    platform: { ios: '11.0' },
+    platform: { [platformKey]: deploymentVersion },
     uses_frameworks: true,
     dependencies: [podName]
   }));

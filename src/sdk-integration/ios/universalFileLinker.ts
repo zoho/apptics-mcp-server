@@ -9,6 +9,7 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { findPbxprojFile, fileExists } from './utils';
+import { resolveContainedPath } from '../pathContainment';
 
 const execFileAsync = promisify(execFile);
 
@@ -28,9 +29,10 @@ async function ensureFileOnDisk(
   content: string,
   overwrite: boolean
 ): Promise<string> {
-  const folder = folderRel ? path.join(projectPath, folderRel) : projectPath;
-  await fs.mkdir(folder, { recursive: true });
-  const dest = path.join(folder, fileName);
+  // Canonicalize the destination and refuse to follow symlinks that escape the project.
+  const relDest = folderRel ? path.join(folderRel, fileName) : fileName;
+  const dest = await resolveContainedPath(projectPath, relDest);
+  await fs.mkdir(path.dirname(dest), { recursive: true });
   if (!(await fileExists(dest)) || overwrite) {
     await fs.writeFile(dest, content, 'utf-8');
   }

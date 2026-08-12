@@ -11,7 +11,10 @@ import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { fileExists } from './utils';
-import { MIN_IOS_DEPLOYMENT_TARGET, normalizeTargets } from './pbxprojUtils';
+import { resolveContainedPath } from '../pathContainment';
+import { getMinDeploymentTarget, normalizeTargets } from './pbxprojUtils';
+import { getBuildSettings } from './xcodeProjectParser';
+import type { ApplePlatform } from './xcodeProjectParser';
 
 /** AppticsNotificationServiceExtension pod requires platform :ios, '15.0' minimum. */
 const NSE_MIN_IOS = '15.0';
@@ -62,7 +65,8 @@ export async function createOrUpdatePodfile(params: {
   const nseTargetsSet = new Set<string>(targets.filter((t) => nseSet.has(t)));
   const targetsSet = new Set<string>(targets);
 
-  const podfilePath = path.join(projectPath, 'Podfile');
+  // Containment guard: never read/write a Podfile that is a symlink escaping the project (CWE-59).
+  const podfilePath = await resolveContainedPath(projectPath, 'Podfile');
   const sdkPod = language === 'swift' ? 'Apptics-Swift' : 'Apptics-SDK';
 
   const usesFsSync = await isFileSystemSyncedProject(projectPath);
@@ -87,8 +91,13 @@ export async function createOrUpdatePodfile(params: {
     ? await readPodfileJSON(podfilePath, projectPath).catch(() => createBasePodfileJSON())
     : createBasePodfileJSON();
 
-  ensureTargets(podfileJson, mainTargetsSet, sdkPod, scriptCmd);
-  ensureTargetDefinitionsExist(podfileJson, nseTargetsSet, NSE_MIN_IOS);
+  const buildSettings = await getBuildSettings(projectPath);
+  const platform = buildSettings.platform;
+  const deploymentVersion = buildSettings.deploymentTarget ?? getMinDeploymentTarget(platform);
+
+  ensureTargets(podfileJson, mainTargetsSet, sdkPod, scriptCmd, platform);
+  // NSE is iOS-only; for macOS projects, nseTargetsSet is typically empty
+  ensureTargetDefinitionsExist(podfileJson, nseTargetsSet, 'ios', NSE_MIN_IOS);
 
   const allMainPodNames: string[] = [...(additionalPodNames ?? [])];
   if (optionalModuleIds && optionalModuleIds.length > 0) {
@@ -121,7 +130,7 @@ export async function createOrUpdatePodfile(params: {
       .forEach((def) => allMainPodNames.forEach((podName) => ensureDependency(def, podName)));
   }
 
-  await writePodfileJSON(podfilePath, projectPath, podfileJson);
+  await writePodfileJSON(podfilePath, projectPath, podfileJson, platform, deploymentVersion);
 
     return {
       success: true,
@@ -190,11 +199,12 @@ interface PodfileJSON {
   [key: string]: unknown;
 }
 
-function renderPodfile(podfile: PodfileJSON, iosVersion: string): string {
+function renderPodfile(podfile: PodfileJSON, platform: ApplePlatform, deploymentVersion: string): string {
+  const podPlatform = platform === 'macos' ? ':osx' : ':ios';
   const lines: string[] = [];
   lines.push(`source 'https://github.com/CocoaPods/Specs.git'`);
   lines.push('');
-  lines.push(`platform :ios, '${iosVersion}'`);
+  lines.push(`platform ${podPlatform}, '${deploymentVersion}'`);
   lines.push('');
 
   const renderTarget = (def: PodTargetDefinition, indent: string) => {
@@ -203,8 +213,9 @@ function renderPodfile(podfile: PodfileJSON, iosVersion: string): string {
     if (def.uses_frameworks) {
       lines.push(`${inner}use_frameworks!`);
     }
-    if (def.platform?.ios) {
-      lines.push(`${inner}platform :ios, '${def.platform.ios}'`);
+    const defPlatform = platform === 'macos' ? def.platform?.osx : def.platform?.ios;
+    if (defPlatform) {
+      lines.push(`${inner}platform ${podPlatform}, '${defPlatform}'`);
     }
     for (const dep of def.dependencies ?? []) {
       const name = dependencyName(dep);
@@ -245,23 +256,29 @@ function ensureTargets(
   podfile: PodfileJSON,
   targets: Set<string>,
   podName: string,
-  script: string
+  script: string,
+  platform: ApplePlatform
 ): void {
   flattenTargetDefinitions(podfile);
   const defs = podfile.target_definitions!;
   targets.forEach((targetName) => {
-    const def = ensureTargetDefinition(defs, targetName);
+    const def = ensureTargetDefinition(defs, targetName, platform);
     ensureDependency(def, podName);
     ensureScriptPhase(def, script);
   });
 }
 
-/** Ensures target definitions exist for NSE (or other) targets without adding core pod or script. Uses platformOverride (e.g. 15.0 for NSE) when provided. */
-function ensureTargetDefinitionsExist(podfile: PodfileJSON, targets: Set<string>, platformOverride?: string): void {
+/** Ensures target definitions exist for NSE (or other) targets without adding core pod or script. Uses platformOverride (e.g. 15.0 for NSE) when provided. NSE is iOS-only. */
+function ensureTargetDefinitionsExist(
+  podfile: PodfileJSON,
+  targets: Set<string>,
+  platform: ApplePlatform,
+  platformOverride?: string
+): void {
   if (targets.size === 0) return;
   flattenTargetDefinitions(podfile);
   const defs = podfile.target_definitions!;
-  targets.forEach((targetName) => ensureTargetDefinition(defs, targetName, platformOverride));
+  targets.forEach((targetName) => ensureTargetDefinition(defs, targetName, platform, platformOverride));
 }
 
 function flattenTargetDefinitions(podfile: PodfileJSON): void {
@@ -276,20 +293,27 @@ function flattenTargetDefinitions(podfile: PodfileJSON): void {
   podfile.target_definitions = flat.filter((d) => d.name !== 'Pods');
 }
 
-function ensureTargetDefinition(defs: PodTargetDefinition[], targetName: string, platformOverride?: string): PodTargetDefinition {
-  const iosVersion = platformOverride ?? MIN_IOS_DEPLOYMENT_TARGET;
+function ensureTargetDefinition(
+  defs: PodTargetDefinition[],
+  targetName: string,
+  platform: ApplePlatform,
+  platformOverride?: string
+): PodTargetDefinition {
+  const minTarget = getMinDeploymentTarget(platform);
+  const version = platformOverride ?? minTarget;
+  const platformKey = platform === 'macos' ? 'osx' : 'ios';
   let def = defs.find((d) => d.name === targetName);
   if (!def) {
     def = {
       name: targetName,
-      platform: { ios: iosVersion },
+      platform: { [platformKey]: version },
       uses_frameworks: true,
       dependencies: [],
       script_phases: []
     };
     defs.push(def);
   } else if (platformOverride) {
-    def.platform = { ...def.platform, ios: platformOverride };
+    def.platform = { ...def.platform, [platformKey]: platformOverride };
   }
   return def;
 }
@@ -336,11 +360,17 @@ function dependencyName(dep: PodDependency): string | undefined {
   return undefined;
 }
 
-async function writePodfileJSON(podfilePath: string, _cwd: string, podfile: PodfileJSON): Promise<void> {
-  const iosVersion =
-    podfile.target_definitions[0]?.children?.[0]?.platform?.ios ||
-    podfile.target_definitions[0]?.platform?.ios ||
-    MIN_IOS_DEPLOYMENT_TARGET;
-  const content = renderPodfile(podfile, iosVersion);
+async function writePodfileJSON(
+  podfilePath: string,
+  _cwd: string,
+  podfile: PodfileJSON,
+  platform: ApplePlatform,
+  deploymentVersion: string
+): Promise<void> {
+  const version =
+    podfile.target_definitions[0]?.children?.[0]?.platform?.[platform === 'macos' ? 'osx' : 'ios'] ||
+    podfile.target_definitions[0]?.platform?.[platform === 'macos' ? 'osx' : 'ios'] ||
+    deploymentVersion;
+  const content = renderPodfile(podfile, platform, version);
   await fs.writeFile(podfilePath, content, 'utf-8');
 }

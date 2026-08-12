@@ -4,20 +4,22 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import {
   getSPMProductNamesFromCocoaPodsPodNames,
   getCocoaPodsPodNamesFromSPMProductNames
 } from '../../sdk-integration/ios/appticsOptionalModules';
 import { findPbxprojFile, fileExists, openProject, getNativeTargets } from '../../sdk-integration/ios/utils';
+import { resolveContainedPath } from '../../sdk-integration/pathContainment';
 import { detectAppticsDependency } from './detectors';
-import { addAppticsPodToPodfile, removeAppticsPodFromPodfile, getAppticsPodNamesFromPodfile, getAppticsPodNamesByTargetFromPodfile } from './podfileEditor';
+import { addAppticsPodToPodfile, removeAppticsPodFromPodfile, getAppticsPodNamesFromPodfile, getAppticsPodNamesByTargetFromPodfile, dedupeAppticsScriptPhasesInPodfile } from './podfileEditor';
 import { addAppticsSPMToProject, removeAppticsSPMFromProject, getAppticsSPMProductNamesFromProject } from './spmEditor';
 import { createBackups, validateBuildAfterSwitch, generateRollbackInstructions, cleanupBackups } from './buildValidator';
 import type { SwitchParams, SwitchResult, IOSLanguage, TargetSelection } from './types';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /**
  * Main function to switch Apptics dependency
@@ -95,7 +97,10 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
         console.error(`Detected SPM products: ${spmProducts.join(', ')} → pods: ${podNamesToAdd.join(', ')}`);
       }
 
-      const podfilePath = path.join(resolvedPath, 'Podfile');
+      // Containment guard: never touch a Podfile that is a symlink escaping the project (CWE-59).
+      const podfilePath = await resolveContainedPath(resolvedPath, 'Podfile');
+      // Pre-clean any duplicate Apptics script phases before touching the Podfile.
+      await dedupeAppticsScriptPhasesInPodfile(podfilePath);
       await addAppticsPodToPodfile(podfilePath, resolvedTargetNames, resolvedLanguage, podNamesToAdd);
       filesChanged.push(podfilePath);
       
@@ -110,7 +115,23 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
         };
         await execAsync(cmd, { cwd: resolvedPath, env, timeout: 300000 });
       } catch (podError: any) {
-        throw new Error(`pod install failed: ${podError.message}. Rollback using backups.`);
+        const msg = String(podError?.message ?? '');
+        const isDuplicatePhase =
+          msg.includes('Script phase with name') &&
+          msg.toLowerCase().includes('apptics pre build');
+        if (isDuplicatePhase) {
+          if (verbose) console.error('Detected duplicate Apptics script phase. Cleaning and retrying pod install...');
+          await dedupeAppticsScriptPhasesInPodfile(podfilePath);
+          const cmd = verbose ? 'pod install --verbose' : 'pod install';
+          const env = {
+            ...process.env,
+            LANG: process.env.LANG ?? 'en_US.UTF-8',
+            LC_ALL: process.env.LC_ALL ?? 'en_US.UTF-8'
+          };
+          await execAsync(cmd, { cwd: resolvedPath, env, timeout: 300000 });
+        } else {
+          throw new Error(`pod install failed: ${podError.message}. Rollback using backups.`);
+        }
       }
       
       // Remove SPM references
@@ -247,8 +268,11 @@ export async function switchAppticsDependency(params: SwitchParams): Promise<Swi
       if (verbose) console.error('Resolving SPM packages...');
       try {
         const xcodeprojName = path.basename(pbxprojPath.replace('/project.pbxproj', ''));
-        const resolveCmd = `cd "${resolvedPath}" && xcodebuild -project "${xcodeprojName}" -resolvePackageDependencies 2>&1`;
-        await execAsync(resolveCmd, { timeout: 120000 });
+        // execFile + cwd (no shell): untrusted project name never reaches a shell (CWE-78).
+        await execFileAsync('xcodebuild', ['-project', xcodeprojName, '-resolvePackageDependencies'], {
+          cwd: resolvedPath,
+          timeout: 120000
+        });
       } catch (resolveError: any) {
         // Don't fail on resolution errors - Xcode will resolve on next build
         if (verbose) console.error(`Package resolution warning: ${resolveError.message}`);

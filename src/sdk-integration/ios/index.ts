@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as os from 'os';
@@ -7,7 +7,9 @@ import {
   addAppticsConfigFile,
   addAppticsManagerWrapper,
   APPTICS_MANAGER_SUGGESTION_SNIPPET,
-  setupMultiEnvironmentConfig
+  setupMultiEnvironmentConfig,
+  APPTICS_MANAGER_FOLDER,
+  APPTICS_MANAGER_FILENAME
 } from './configFile';
 import { createOrUpdatePodfile, runPodInstall } from './cocoapodsIntegration';
 import {
@@ -17,9 +19,11 @@ import {
   repairLegacyAppticsScriptNames
 } from './buildScriptPhase';
 import { addAppticsImport, addAppticsInitialization } from './entryInjection';
+import { resolveContainedPath } from '../pathContainment';
 import {
   MIN_COCOAPODS_VERSION,
   MIN_IOS_DEPLOYMENT_TARGET,
+  getMinDeploymentTarget,
   MIN_SWIFT_VERSION,
   MIN_XCODE_VERSION,
   AppticsInitConfig,
@@ -30,6 +34,7 @@ import {
   normalizeTargets,
   resolveEntryFileForTarget
 } from './pbxprojUtils';
+import type { ApplePlatform } from './xcodeProjectParser';
 import { addSPMPackage } from './spmIntegration';
 import { fileExists, findPbxprojFile, openProject, getNativeTargets } from './utils';
 import { readPodfileJSON } from '../../dependency-switcher/ios/podfileEditor';
@@ -99,6 +104,7 @@ async function scanProjectForAppticsInit(
 }
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /**
  * Generate helpful installation instructions for missing prerequisites
@@ -145,14 +151,16 @@ function generateInstallationInstructions(
     }
   }
   
-  // Check for iOS deployment target
-  if (prereqResult.iosTargetVersion !== 'Unknown' && 
-      !isVersionAtLeast(prereqResult.iosTargetVersion, MIN_IOS_DEPLOYMENT_TARGET)) {
+  // Check for deployment target (iOS or macOS)
+  const platformLabel = prereqResult.platform === 'macos' ? 'macOS' : 'iOS';
+  const minTarget = getMinDeploymentTarget(prereqResult.platform);
+  if (prereqResult.deploymentTarget !== 'Unknown' &&
+      !isVersionAtLeast(prereqResult.deploymentTarget, minTarget)) {
     instructions.push(
-      `📦 iOS Deployment Target Update Required:\n` +
-      `   - Current target: iOS ${prereqResult.iosTargetVersion}\n` +
-      `   - Required: iOS ${MIN_IOS_DEPLOYMENT_TARGET} or later\n` +
-      `   - Update in Xcode: Project Settings → Deployment Info → iOS Deployment Target`
+      `📦 ${platformLabel} Deployment Target Update Required:\n` +
+      `   - Current target: ${platformLabel} ${prereqResult.deploymentTarget}\n` +
+      `   - Required: ${platformLabel} ${minTarget} or later\n` +
+      `   - Update in Xcode: Project Settings → Deployment Info → ${platformLabel} Deployment Target`
     );
   }
   
@@ -193,6 +201,9 @@ export async function checkIOSPrerequisites(projectPath: string, packageManager:
   const results = {
     xcodeVersion: '',
     cocoapodsVersion: '',
+    platform: 'ios' as ApplePlatform,
+    deploymentTarget: '',
+    /** @deprecated Use deploymentTarget; kept for backward compatibility */
     iosTargetVersion: '',
     swiftVersion: '',
     missingRequirements: [] as string[],
@@ -220,14 +231,18 @@ export async function checkIOSPrerequisites(projectPath: string, packageManager:
     }
 
     const buildSettings = await getBuildSettings(projectPath);
-    results.iosTargetVersion = buildSettings.iosDeploymentTarget ?? 'Unknown';
+    results.platform = buildSettings.platform;
+    results.deploymentTarget = buildSettings.deploymentTarget ?? 'Unknown';
+    results.iosTargetVersion = buildSettings.deploymentTarget ?? 'Unknown'; // backward compat
     results.swiftVersion = buildSettings.swiftVersion ?? toolVersions.swiftVersion ?? '';
     
+    const minTarget = getMinDeploymentTarget(results.platform);
+    const platformLabel = results.platform === 'macos' ? 'macOS' : 'iOS';
     if (
-      results.iosTargetVersion !== 'Unknown' &&
-      !isVersionAtLeast(results.iosTargetVersion, MIN_IOS_DEPLOYMENT_TARGET)
+      results.deploymentTarget !== 'Unknown' &&
+      !isVersionAtLeast(results.deploymentTarget, minTarget)
     ) {
-      results.missingRequirements.push(`iOS ${MIN_IOS_DEPLOYMENT_TARGET} or later target required`);
+      results.missingRequirements.push(`${platformLabel} ${minTarget} or later target required`);
     }
 
     if (results.swiftVersion && !isVersionAtLeast(results.swiftVersion, MIN_SWIFT_VERSION)) {
@@ -260,6 +275,11 @@ export async function verifyProjectBuilds(params: {
   try {
     if (verbose) console.error('Verifying project builds successfully before integration...');
     
+    const buildSettings = await getBuildSettings(projectPath);
+    const platformDestination = buildSettings.platform === 'macos'
+      ? 'generic/platform=macOS'
+      : 'generic/platform=iOS';
+    
     const pbxprojPath = await findPbxprojFile(projectPath);
     const xcodeprojPath = path.dirname(pbxprojPath);
     const xcodeprojName = path.basename(xcodeprojPath);
@@ -267,30 +287,46 @@ export async function verifyProjectBuilds(params: {
     const workspacePath = path.join(projectPath, `${projectBaseName}.xcworkspace`);
     const workspaceExists = await fileExists(path.join(workspacePath, 'contents.xcworkspacedata'));
     const derivedDataPath = path.join(os.tmpdir(), `AppticsVerifyBuild-${Date.now()}`);
-    const derivedDataArg = `-derivedDataPath "${derivedDataPath}"`;
     const buildDir = path.join(derivedDataPath, 'Build');
-    const symrootObjroot = `SYMROOT="${buildDir}" OBJROOT="${path.join(buildDir, 'Intermediates.noindex')}"`;
-    const destinationArg = `-destination "generic/platform=iOS"`;
-    const schemeBuildArgs = `-scheme "${targetName}" ${destinationArg} -configuration Debug ${derivedDataArg} ${symrootObjroot}`;
     const targetBuildDir = path.join(os.tmpdir(), `AppticsVerifyBuild-${Date.now()}-target`);
-    const targetBuildArgs = `-target "${targetName}" ${destinationArg} -configuration Debug SYMROOT="${targetBuildDir}" OBJROOT="${targetBuildDir}"`;
 
-    const buildOpts = 'CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1';
-    let buildCommand: string;
-    if (workspaceExists) {
-      buildCommand = `xcodebuild -workspace "${projectBaseName}.xcworkspace" ${schemeBuildArgs} clean build ${buildOpts}`;
-    } else {
-      buildCommand = `xcodebuild -project "${xcodeprojName}" ${schemeBuildArgs} clean build ${buildOpts}`;
-    }
+    // Build xcodebuild invocations as argument ARRAYS (execFile, no shell). Untrusted,
+    // project-derived values (targetName, xcodeproj/workspace name) are passed as discrete
+    // args and never interpreted by a shell — this closes shell command injection (CWE-78).
+    const commonBuildSettings = [
+      'CODE_SIGN_IDENTITY=',
+      'CODE_SIGNING_REQUIRED=NO',
+      'CODE_SIGNING_ALLOWED=NO'
+    ];
+    const schemeBuildArgs = [
+      '-scheme', targetName,
+      '-destination', platformDestination,
+      '-configuration', 'Debug',
+      '-derivedDataPath', derivedDataPath,
+      `SYMROOT=${buildDir}`,
+      `OBJROOT=${path.join(buildDir, 'Intermediates.noindex')}`
+    ];
+    const targetBuildArgs = [
+      '-target', targetName,
+      '-destination', platformDestination,
+      '-configuration', 'Debug',
+      `SYMROOT=${targetBuildDir}`,
+      `OBJROOT=${targetBuildDir}`
+    ];
+
+    let buildArgs: string[] = workspaceExists
+      ? ['-workspace', `${projectBaseName}.xcworkspace`, ...schemeBuildArgs, 'clean', 'build', ...commonBuildSettings]
+      : ['-project', xcodeprojName, ...schemeBuildArgs, 'clean', 'build', ...commonBuildSettings];
+    let buildCommand = `xcodebuild ${buildArgs.join(' ')}`;
     let buildOutput = '';
     let buildSucceeded = false;
-    
+
     try {
-      const { stdout, stderr } = await execAsync(buildCommand, {
+      const { stdout, stderr } = await execFileAsync('xcodebuild', buildArgs, {
         cwd: projectPath,
         maxBuffer: 10 * 1024 * 1024
       });
-      
+
       buildOutput = stdout + stderr;
       buildSucceeded = buildOutput.includes('BUILD SUCCEEDED');
     } catch (error: any) {
@@ -299,14 +335,15 @@ export async function verifyProjectBuilds(params: {
       if (errMsg.includes('scheme') || output.includes('scheme') || output.includes('derivedDataPath')) {
         if (verbose) console.error('Scheme not found or derivedDataPath not allowed, trying direct target build...');
         // xcodebuild does NOT allow -target with -workspace; must use -project + -target for fallback
-        buildCommand = `xcodebuild -project "${xcodeprojName}" ${targetBuildArgs} clean build ${buildOpts}`;
-        
+        buildArgs = ['-project', xcodeprojName, ...targetBuildArgs, 'clean', 'build', ...commonBuildSettings];
+        buildCommand = `xcodebuild ${buildArgs.join(' ')}`;
+
         try {
-          const { stdout, stderr } = await execAsync(buildCommand, {
+          const { stdout, stderr } = await execFileAsync('xcodebuild', buildArgs, {
             cwd: projectPath,
             maxBuffer: 10 * 1024 * 1024
           });
-          
+
           buildOutput = stdout + stderr;
           buildSucceeded = buildOutput.includes('BUILD SUCCEEDED');
         } catch (targetError: any) {
@@ -675,6 +712,43 @@ export async function completeIOSIntegration(params: {
   if (targets.length === 0) {
     throw new Error('No target names provided for integration.');
   }
+
+  // ── Fail-fast security pre-flight (runs before ANY project change) ─────────────
+  // Refuse immediately if a known write target resolves outside the project via a
+  // symlink, so an untrusted project can never redirect a write out of its tree and
+  // integration never leaves a half-applied state (CWE-59 / CWE-22). This throws
+  // before the mutating steps begin, so nothing is written on refusal.
+  {
+    const managerFileName = managerFilePath ? path.basename(managerFilePath) : APPTICS_MANAGER_FILENAME;
+    const writeTargets: Array<{ label: string; target: string }> = [
+      { label: 'AppticsManager wrapper', target: path.join(APPTICS_MANAGER_FOLDER, managerFileName) },
+      { label: 'apptics-config.plist', target: 'apptics-config.plist' }
+    ];
+    if (packageManager === 'cocoapods') {
+      writeTargets.push({ label: 'Podfile', target: 'Podfile' });
+    }
+    for (const tgt of targets) {
+      try {
+        const entry = await resolveEntryFileForTarget(projectPath, tgt, entryPoint, language, entryFilePath);
+        writeTargets.push({ label: `entry file (${tgt})`, target: entry });
+      } catch {
+        // Entry file is resolved again later; skip here if it cannot be resolved yet.
+      }
+    }
+    for (const { label, target } of writeTargets) {
+      try {
+        await resolveContainedPath(projectPath, target);
+      } catch (err) {
+        throw new Error(
+          `Integration aborted before any changes were made: the ${label} write target resolves ` +
+          `outside the selected project directory (likely a symlink). ${(err as Error).message}`
+        );
+      }
+    }
+    // Also validates that the .xcodeproj / project.pbxproj is not a symlink escaping the project.
+    await findPbxprojFile(projectPath);
+  }
+
   /** Only add imports, config, and AppticsManager content for modules whose pods are actually installed (CocoaPods: exclude skipped pods). */
   const optionalIdsForCode =
     packageManager === 'cocoapods' && optionalModuleIds?.length
@@ -898,6 +972,7 @@ export async function completeIOSIntegration(params: {
     if (verbose) console.error('Step 7: Adding import...');
     for (const [entryPath] of entryFiles) {
       await addAppticsImport({
+        projectPath,
         entryFilePath: entryPath,
         language,
         packageManager,
@@ -914,6 +989,7 @@ export async function completeIOSIntegration(params: {
     if (!skipManagerBecauseDirectInit) {
       for (const [entryPath] of entryFiles) {
         const initParams: Parameters<typeof addAppticsInitialization>[0] = {
+          projectPath,
           entryFilePath: entryPath,
           language,
           entryPoint,
