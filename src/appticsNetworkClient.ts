@@ -10,6 +10,7 @@ export type AppticsNetworkClientOptions = {
 type AppticsTokenResponse = {
   access_token: string;
   refresh_token?: string;
+  expires_in?: number;
 };
 
 export class AppticsNetworkClient {
@@ -19,6 +20,7 @@ export class AppticsNetworkClient {
   private readonly appticsUri: string;
   private readonly accountsUri: string;
   private accessToken: string | null;
+  private tokenExpiresAt: number;
 
   constructor({
     clientId,
@@ -33,6 +35,7 @@ export class AppticsNetworkClient {
     this.appticsUri = appticsUri;
     this.accountsUri = accountsUri;
     this.accessToken = null;
+    this.tokenExpiresAt = 0;
   }
 
   private formatDate(date: Date): string {
@@ -70,11 +73,42 @@ export class AppticsNetworkClient {
     };
   }
 
-  private async httpRequest(url: string, init?: RequestInit): Promise<unknown> {
-    const response = await fetch(url, init);
+  // Sends an authorized request; on 401 the cached token is dropped,
+  // refreshed and the request retried once.
+  private async authorizedFetch(
+    url: string,
+    extraHeaders: Record<string, string> = {}
+  ): Promise<Response> {
+    let accessToken = await this.getAccessToken();
+    let response = await fetch(url, {
+      headers: {
+        Authorization: `Zoho-oauthtoken ${accessToken}`,
+        ...extraHeaders
+      }
+    });
+
+    if (response.status === 401) {
+      this.accessToken = null;
+      accessToken = await this.getAccessToken();
+      response = await fetch(url, {
+        headers: {
+          Authorization: `Zoho-oauthtoken ${accessToken}`,
+          ...extraHeaders
+        }
+      });
+    }
+
+    return response;
+  }
+
+  private async httpRequest(
+    url: string,
+    extraHeaders: Record<string, string> = {}
+  ): Promise<unknown> {
+    const response = await this.authorizedFetch(url, extraHeaders);
     if (!response.ok) {
       const err = await response.text()
-      throw new Error(`Failed to get crashes count. ${response.status} \n ${err}`)
+      throw new Error(`Request failed. ${response.status} \n ${err}`)
     }
     return response.json() as {}
   }
@@ -90,8 +124,6 @@ export class AppticsNetworkClient {
     offset?: string,
     limit?: string
   ): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
-
     const startAndEndDate = this.getStartAndEndDate(startDate, endDate);
     const queryParams = new URLSearchParams({
       startdate: startAndEndDate.startDate,
@@ -117,11 +149,8 @@ export class AppticsNetworkClient {
     }
 
     return await this.httpRequest(`${this.appticsUri}cx/api/v1/crash/list?${queryParams}`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -133,10 +162,8 @@ export class AppticsNetworkClient {
     appVersion?: string,
     platform?: string
   ): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
-
     const startAndEndDate = this.getStartAndEndDate(startDate, endDate);
-    
+
     const queryParams = new URLSearchParams({
       startdate: startAndEndDate.startDate,
       enddate: startAndEndDate.endDate,
@@ -150,11 +177,8 @@ export class AppticsNetworkClient {
     }
 
     return await this.httpRequest(`${this.appticsUri}cx/api/v1/crash/summary?${queryParams}`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -166,10 +190,8 @@ export class AppticsNetworkClient {
     endDate?: string,
     appVersion?: string
   ): Promise<unknown> {
-    const accessToken = this.getAccessToken();
-
     const startAndEndDate = this.getStartAndEndDate(startDate, endDate);
-    
+
     const queryParams = new URLSearchParams({
       startdate: startAndEndDate.startDate,
       enddate: startAndEndDate.endDate
@@ -180,11 +202,8 @@ export class AppticsNetworkClient {
     }
 
     return await this.httpRequest(`${this.appticsUri}cx/api/v1/crash/${uniqueId}/summarywithtrace?${queryParams}`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -197,10 +216,8 @@ export class AppticsNetworkClient {
     appVersion?: string,
     platform?: string
   ): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
-
     const startAndEndDate = this.getStartAndEndDate(startDate, endDate);
-    
+
     const queryParams = new URLSearchParams({
       startdate: startAndEndDate.startDate,
       enddate: startAndEndDate.endDate,
@@ -214,11 +231,8 @@ export class AppticsNetworkClient {
     }
 
     return await this.httpRequest(`${this.appticsUri}cx/api/v1/crash/countbydate?${queryParams}`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -232,8 +246,6 @@ export class AppticsNetworkClient {
     limit?: string,
     offset?: string
   ): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
-
     const startAndEndDate = this.getStartAndEndDate(startDate, endDate);
     
     const queryParams = new URLSearchParams({
@@ -254,11 +266,8 @@ export class AppticsNetworkClient {
     }
 
     return await this.httpRequest(`${this.appticsUri}cx/api/v1/crash/devicemodel?${queryParams}`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -270,8 +279,6 @@ export class AppticsNetworkClient {
     endDate?: string,
     group?: string
   ): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
-
     let sDate: string;
     let eDate: string;
     if (!startDate || !endDate) {
@@ -297,11 +304,8 @@ export class AppticsNetworkClient {
     });
 
     return this.httpRequest(`${this.appticsUri}cx/api/v1/activedevice/multigroup?${queryParams}`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -310,13 +314,9 @@ export class AppticsNetworkClient {
    * Retrieves a list of applications for the specified project.
    */
   async getApplications(projectId: string, zsoId: string): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
     return this.httpRequest(`${this.appticsUri}ec/api/v1/applications`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        projectid: projectId,
-        zsoid: zsoId
-      }
+      projectid: projectId,
+      zsoid: zsoId
     });
   }
 
@@ -330,15 +330,11 @@ export class AppticsNetworkClient {
     zsoId: string,
     aaid: number
   ): Promise<string> {
-    const accessToken = await this.getAccessToken();
-    const response = await fetch(
+    const response = await this.authorizedFetch(
       `${this.appticsUri}ec/api/v1/downloadconfigfile?aaid=${aaid}`,
       {
-        headers: {
-          Authorization: `Zoho-oauthtoken ${accessToken}`,
-          projectid: projectId,
-          zsoid: zsoId
-        }
+        projectid: projectId,
+        zsoid: zsoId
       }
     );
     if (!response.ok) {
@@ -349,12 +345,7 @@ export class AppticsNetworkClient {
   }
 
   async getPortalsAndProjects(): Promise<unknown> {
-    const accessToken = await this.getAccessToken();
-    const response = await fetch(`${this.appticsUri}cx/api/v1/userprojects`, {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`
-      }
-    });
+    const response = await this.authorizedFetch(`${this.appticsUri}cx/api/v1/userprojects`);
 
     if (!response.ok) {
       throw new Error("Failed while fetching portals and projects");
@@ -365,7 +356,7 @@ export class AppticsNetworkClient {
   }
 
   private async getAccessToken(): Promise<string> {
-    if (this.accessToken) {
+    if (this.accessToken && Date.now() < this.tokenExpiresAt) {
       return this.accessToken;
     }
 
@@ -392,12 +383,15 @@ export class AppticsNetworkClient {
     });
 
     if (!response.ok) {
-      const err = response.text();
+      const err = await response.text();
       throw new Error(`Failed to obtain access token. ${response.status} \n ${err}`)
     }
 
     const data = await response.json() as AppticsTokenResponse;
     this.accessToken = data.access_token;
+    // refresh 60s before actual expiry (Zoho tokens last ~1h)
+    const expiresInSeconds = data.expires_in ?? 3600;
+    this.tokenExpiresAt = Date.now() + Math.max(expiresInSeconds - 60, 60) * 1000;
 
     if (data.refresh_token) {
       this.refreshToken = data.refresh_token;
